@@ -87,6 +87,7 @@ def run_primary_loop(
                     "new_asset_ids_count": cycle_state["new_asset_ids_count"],
                     "books_hot_snapshot_count": cycle_state["books_hot_snapshot_count"],
                     "books_cold_snapshot_count": cycle_state["books_cold_snapshot_count"],
+                    "collection_warnings": cycle_state["collection_warnings"],
                     "bootstrap_warnings": cycle_state["bootstrap_warnings"],
                 },
             )
@@ -185,6 +186,7 @@ def run_backup_loop(
                         "new_asset_ids_count": cycle_state["new_asset_ids_count"],
                         "books_hot_snapshot_count": cycle_state["books_hot_snapshot_count"],
                         "books_cold_snapshot_count": cycle_state["books_cold_snapshot_count"],
+                        "collection_warnings": cycle_state["collection_warnings"],
                         "bootstrap_warnings": cycle_state["bootstrap_warnings"],
                     },
                 )
@@ -263,43 +265,62 @@ def _collect_cycle(
     current_state = UniverseState(condition_ids=set(condition_ids), asset_ids=set(asset_ids))
     new_condition_ids = sorted(current_state.condition_ids - previous_state.condition_ids)
     new_asset_ids = sorted(current_state.asset_ids - previous_state.asset_ids)
+    collection_warnings: list[str] = []
 
     # 1) Normal cycle collection for current known universe.
-    collector.fetch_trades(
-        condition_ids=condition_ids[:max_markets_for_trades] or None,
-        limit=500,
-        taker_only=False,
-    )
-    books_hot_snapshot_count, books_cold_snapshot_count = _collect_tiered_book_snapshots(
-        collector=collector,
-        asset_ids=asset_ids,
-        max_assets_for_books=max_assets_for_books,
-        hot_assets_for_books=hot_assets_for_books,
-        hot_snapshot_interval_seconds=hot_snapshot_interval_seconds,
-        cold_snapshot_interval_seconds=cold_snapshot_interval_seconds,
-        snapshot_state=snapshot_state,
-    )
-
-    if asset_ids[:max_assets_for_ws]:
-        collector.stream_market(
-            asset_ids=asset_ids[:max_assets_for_ws],
-            duration_seconds=ws_duration_seconds,
-        )
-
-    # 2) Bootstrap collection for newly discovered markets/tokens.
-    if new_condition_ids:
+    try:
         collector.fetch_trades(
-            condition_ids=new_condition_ids[:max_markets_for_trades],
+            condition_ids=condition_ids[:max_markets_for_trades] or None,
             limit=500,
             taker_only=False,
         )
+    except Exception as exc:  # noqa: BLE001
+        collection_warnings.append(f"fetch_trades_failed:{exc}")
+
+    try:
+        books_hot_snapshot_count, books_cold_snapshot_count = _collect_tiered_book_snapshots(
+            collector=collector,
+            asset_ids=asset_ids,
+            max_assets_for_books=max_assets_for_books,
+            hot_assets_for_books=hot_assets_for_books,
+            hot_snapshot_interval_seconds=hot_snapshot_interval_seconds,
+            cold_snapshot_interval_seconds=cold_snapshot_interval_seconds,
+            snapshot_state=snapshot_state,
+        )
+    except Exception as exc:  # noqa: BLE001
+        books_hot_snapshot_count = 0
+        books_cold_snapshot_count = 0
+        collection_warnings.append(f"book_snapshot_failed:{exc}")
+
+    if asset_ids[:max_assets_for_ws]:
+        try:
+            collector.stream_market(
+                asset_ids=asset_ids[:max_assets_for_ws],
+                duration_seconds=ws_duration_seconds,
+            )
+        except Exception as exc:  # noqa: BLE001
+            collection_warnings.append(f"stream_market_failed:{exc}")
+
+    # 2) Bootstrap collection for newly discovered markets/tokens.
+    if new_condition_ids:
+        try:
+            collector.fetch_trades(
+                condition_ids=new_condition_ids[:max_markets_for_trades],
+                limit=500,
+                taker_only=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            collection_warnings.append(f"bootstrap_fetch_trades_failed:{exc}")
 
     bootstrap_warnings: list[str] = []
     if new_asset_ids:
         bootstrap_assets = new_asset_ids[:max_assets_for_books]
-        collector.fetch_books(token_ids=bootstrap_assets)
-        collector.fetch_midpoints(token_ids=bootstrap_assets)
-        collector.fetch_spreads(token_ids=bootstrap_assets)
+        try:
+            collector.fetch_books(token_ids=bootstrap_assets)
+            collector.fetch_midpoints(token_ids=bootstrap_assets)
+            collector.fetch_spreads(token_ids=bootstrap_assets)
+        except Exception as exc:  # noqa: BLE001
+            bootstrap_warnings.append(f"bootstrap_books_failed:{exc}")
 
         now_ts = int(datetime.now(UTC).timestamp())
         start_ts = now_ts - max(new_market_backfill_seconds, 60)
@@ -320,6 +341,7 @@ def _collect_cycle(
         "new_asset_ids_count": len(new_asset_ids),
         "books_hot_snapshot_count": books_hot_snapshot_count,
         "books_cold_snapshot_count": books_cold_snapshot_count,
+        "collection_warnings": collection_warnings,
         "bootstrap_warnings": bootstrap_warnings,
     }
 

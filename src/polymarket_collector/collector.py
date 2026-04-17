@@ -34,6 +34,7 @@ GAMMA_API = "https://gamma-api.polymarket.com"
 DATA_API = "https://data-api.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
 MARKET_WSS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+MAX_TRADE_MARKET_QUERY_CHARS = 3000
 
 
 @dataclass(slots=True)
@@ -203,17 +204,27 @@ class PolymarketCollector:
         limit: int = 500,
         taker_only: bool = False,
     ) -> tuple[list[dict[str, Any]], Path | None]:
-        params: dict[str, Any] = {"limit": limit, "takerOnly": str(taker_only).lower()}
-        if condition_ids:
-            params["market"] = ",".join(condition_ids)
-
-        response = self.session.get(
-            f"{DATA_API}/trades",
-            params=params,
-            timeout=self.config.timeout_seconds,
+        market_batches = _chunk_joined_values(
+            values=condition_ids or [],
+            max_joined_chars=MAX_TRADE_MARKET_QUERY_CHARS,
         )
-        response.raise_for_status()
-        trades = response.json()
+        if not market_batches:
+            market_batches = [None]
+
+        trades: list[dict[str, Any]] = []
+        for market_batch in market_batches:
+            params: dict[str, Any] = {"limit": limit, "takerOnly": str(taker_only).lower()}
+            if market_batch:
+                params["market"] = ",".join(market_batch)
+
+            response = self.session.get(
+                f"{DATA_API}/trades",
+                params=params,
+                timeout=self.config.timeout_seconds,
+            )
+            response.raise_for_status()
+            trades.extend(response.json())
+
         wrapped = [self._wrap_record("data_trades", trade) for trade in trades]
         path = self.writer.write("data_trades", wrapped)
         return trades, path
@@ -458,6 +469,30 @@ def _normalize_token_ids(value: Any) -> list[str]:
         if isinstance(parsed, list):
             return [str(item) for item in parsed if item]
     return []
+
+
+def _chunk_joined_values(*, values: list[str], max_joined_chars: int) -> list[list[str]]:
+    if not values:
+        return []
+
+    chunks: list[list[str]] = []
+    current: list[str] = []
+    current_len = 0
+
+    for value in values:
+        item = str(value)
+        item_len = len(item) if not current else len(item) + 1
+        if current and current_len + item_len > max_joined_chars:
+            chunks.append(current)
+            current = [item]
+            current_len = len(item)
+            continue
+        current.append(item)
+        current_len += item_len
+
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 def _build_pyclob_client(clob_driver: str):
