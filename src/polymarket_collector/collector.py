@@ -344,7 +344,7 @@ class PolymarketCollector:
         token_ids: list[str],
         start_ts: int | None = None,
         end_ts: int | None = None,
-        interval: str = "1h",
+        interval: str | None = "1h",
         fidelity: int = 1,
     ) -> tuple[dict[str, Any], Path | None]:
         history: dict[str, Any] = {}
@@ -358,13 +358,13 @@ class PolymarketCollector:
             )
             history = _merge_dict_results(history, batch_result)
 
-        payload = {
-            "markets": token_ids,
-            "interval": interval,
-            "fidelity": fidelity,
-            **({"start_ts": start_ts} if start_ts is not None else {}),
-            **({"end_ts": end_ts} if end_ts is not None else {}),
-        }
+        payload = _build_batch_prices_history_payload(
+            token_ids=token_ids,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            interval=interval,
+            fidelity=fidelity,
+        )
         wrapped = [self._wrap_record("clob_batch_prices_history", {"request": payload, "result": history})]
         path = self.writer.write("clob_batch_prices_history", wrapped)
         return history, path
@@ -375,18 +375,16 @@ class PolymarketCollector:
         token_ids: list[str],
         start_ts: int | None,
         end_ts: int | None,
-        interval: str,
+        interval: str | None,
         fidelity: int,
     ) -> dict[str, Any]:
-        payload: dict[str, Any] = {
-            "markets": token_ids,
-            "interval": interval,
-            "fidelity": fidelity,
-        }
-        if start_ts is not None:
-            payload["start_ts"] = start_ts
-        if end_ts is not None:
-            payload["end_ts"] = end_ts
+        payload = _build_batch_prices_history_payload(
+            token_ids=token_ids,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            interval=interval,
+            fidelity=fidelity,
+        )
 
         response = self.session.post(
             f"{CLOB_API}/batch-prices-history",
@@ -396,6 +394,25 @@ class PolymarketCollector:
         try:
             response.raise_for_status()
         except requests.HTTPError:
+            if _is_absolute_history_request(start_ts=start_ts, end_ts=end_ts) and "interval" in payload:
+                retry_payload = dict(payload)
+                retry_payload.pop("interval", None)
+                retry_response = self.session.post(
+                    f"{CLOB_API}/batch-prices-history",
+                    json=retry_payload,
+                    timeout=self.config.timeout_seconds,
+                )
+                try:
+                    retry_response.raise_for_status()
+                except requests.HTTPError:
+                    response = retry_response
+                else:
+                    response = retry_response
+            if response.status_code < 400:
+                payload = response.json()
+                if isinstance(payload, dict) and isinstance(payload.get("history"), dict):
+                    return payload["history"]
+                return payload
             # If payload constraints change upstream, split the chunk recursively
             # so one bad batch does not fail the entire collection cycle.
             if response.status_code == 400 and len(token_ids) > 1:
@@ -635,6 +652,52 @@ def _chunk_values(*, values: list[str], max_batch_size: int) -> list[list[str]]:
         return []
     size = max(1, max_batch_size)
     return [values[index : index + size] for index in range(0, len(values), size)]
+
+
+def _build_batch_prices_history_payload(
+    *,
+    token_ids: list[str],
+    start_ts: int | None,
+    end_ts: int | None,
+    interval: str | None,
+    fidelity: int,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "markets": token_ids,
+        "fidelity": fidelity,
+    }
+    if start_ts is not None:
+        payload["start_ts"] = start_ts
+    if end_ts is not None:
+        payload["end_ts"] = end_ts
+
+    normalized_interval = _normalize_batch_prices_history_interval(
+        interval=interval,
+        start_ts=start_ts,
+        end_ts=end_ts,
+    )
+    if normalized_interval is not None:
+        payload["interval"] = normalized_interval
+    return payload
+
+
+def _normalize_batch_prices_history_interval(
+    *,
+    interval: str | None,
+    start_ts: int | None,
+    end_ts: int | None,
+) -> str | None:
+    text = (interval or "").strip()
+    if _is_absolute_history_request(start_ts=start_ts, end_ts=end_ts):
+        # Polymarket treats interval values such as 1m/1h/1d as window selectors.
+        # When callers provide an explicit timestamp range, use the full-range mode
+        # instead of mixing relative intervals with absolute bounds.
+        return "all"
+    return text or None
+
+
+def _is_absolute_history_request(*, start_ts: int | None, end_ts: int | None) -> bool:
+    return start_ts is not None or end_ts is not None
 
 
 def _merge_dict_results(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:

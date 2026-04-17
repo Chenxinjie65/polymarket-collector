@@ -173,9 +173,11 @@ python -m polymarket_collector run-primary \
   --max-assets-for-history 1000 \
   --history-snapshot-interval-seconds 1800 \
   --history-window-seconds 3600 \
-  --history-interval 1m \
+  --history-interval all \
   --new-market-backfill-seconds 1800
 ```
+
+For CLOB price history, `interval` is not a minute bucket selector. Polymarket treats values like `1m` as a relative window (`1 month`), while `fidelity` controls point density. This collector uses `start_ts` / `end_ts` for bounded snapshots, so `--history-interval all` is the safe default.
 
 This mode continuously writes these raw sources when the upstream APIs respond successfully:
 

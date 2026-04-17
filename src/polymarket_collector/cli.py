@@ -345,7 +345,11 @@ def build_parser() -> argparse.ArgumentParser:
     history.add_argument("--max-assets", type=int, default=20, help="Maximum number of asset IDs")
     history.add_argument("--start-ts", type=int, default=None, help="Unix start timestamp")
     history.add_argument("--end-ts", type=int, default=None, help="Unix end timestamp")
-    history.add_argument("--interval", default="1h", help="History interval")
+    history.add_argument(
+        "--interval",
+        default="1h",
+        help="History interval. When start/end timestamps are provided, the collector normalizes this to all.",
+    )
     history.add_argument("--fidelity", type=int, default=1, help="History fidelity")
 
     oi = subparsers.add_parser("fetch-oi", help="Fetch open interest")
@@ -497,8 +501,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     primary.add_argument(
         "--history-interval",
-        default="1m",
-        help="Interval passed to batch price history",
+        default="all",
+        help="Interval passed to batch price history. Use all for timestamp-bounded snapshots; fidelity controls resolution.",
     )
     primary.add_argument(
         "--history-fidelity",
@@ -579,8 +583,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     backup.add_argument(
         "--history-interval",
-        default="1m",
-        help="Interval passed to backup batch price history",
+        default="all",
+        help="Interval passed to backup batch price history. Use all for timestamp-bounded snapshots; fidelity controls resolution.",
     )
     backup.add_argument(
         "--history-fidelity",
