@@ -35,6 +35,10 @@ DATA_API = "https://data-api.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
 MARKET_WSS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 MAX_TRADE_MARKET_QUERY_CHARS = 3000
+MAX_CLOB_BOOKS_BATCH_SIZE = 100
+MAX_CLOB_MIDPOINTS_BATCH_SIZE = 200
+MAX_CLOB_SPREADS_BATCH_SIZE = 200
+MAX_CLOB_BATCH_HISTORY_BATCH_SIZE = 100
 
 
 @dataclass(slots=True)
@@ -230,46 +234,53 @@ class PolymarketCollector:
         return trades, path
 
     def fetch_books(self, *, token_ids: list[str]) -> tuple[list[dict[str, Any]], Path | None]:
-        if self.config.clob_driver == "pyclob":
-            books = self._fetch_books_pyclob(token_ids=token_ids)
-            wrapped = [self._wrap_record("clob_books", book) for book in books]
-            path = self.writer.write("clob_books", wrapped)
-            return books, path
+        books: list[dict[str, Any]] = []
+        for token_batch in _chunk_values(values=token_ids, max_batch_size=MAX_CLOB_BOOKS_BATCH_SIZE):
+            if self.config.clob_driver == "pyclob":
+                books.extend(self._fetch_books_pyclob(token_ids=token_batch))
+                continue
 
-        payload = [{"token_id": token_id} for token_id in token_ids]
-        response = self.session.post(
-            f"{CLOB_API}/books",
-            json=payload,
-            timeout=self.config.timeout_seconds,
-        )
-        response.raise_for_status()
-        books = response.json()
+            payload = [{"token_id": token_id} for token_id in token_batch]
+            response = self.session.post(
+                f"{CLOB_API}/books",
+                json=payload,
+                timeout=self.config.timeout_seconds,
+            )
+            response.raise_for_status()
+            books.extend(response.json())
+
         wrapped = [self._wrap_record("clob_books", book) for book in books]
         path = self.writer.write("clob_books", wrapped)
         return books, path
 
     def fetch_midpoints(self, *, token_ids: list[str]) -> tuple[dict[str, Any], Path | None]:
-        payload = [{"token_id": token_id} for token_id in token_ids]
-        response = self.session.post(
-            f"{CLOB_API}/midpoints",
-            json=payload,
-            timeout=self.config.timeout_seconds,
-        )
-        response.raise_for_status()
-        midpoints = response.json()
+        midpoints: dict[str, Any] = {}
+        for token_batch in _chunk_values(values=token_ids, max_batch_size=MAX_CLOB_MIDPOINTS_BATCH_SIZE):
+            payload = [{"token_id": token_id} for token_id in token_batch]
+            response = self.session.post(
+                f"{CLOB_API}/midpoints",
+                json=payload,
+                timeout=self.config.timeout_seconds,
+            )
+            response.raise_for_status()
+            midpoints.update(response.json())
+
         wrapped = [self._wrap_record("clob_midpoints", {"token_ids": token_ids, "result": midpoints})]
         path = self.writer.write("clob_midpoints", wrapped)
         return midpoints, path
 
     def fetch_spreads(self, *, token_ids: list[str]) -> tuple[dict[str, Any], Path | None]:
-        payload = [{"token_id": token_id} for token_id in token_ids]
-        response = self.session.post(
-            f"{CLOB_API}/spreads",
-            json=payload,
-            timeout=self.config.timeout_seconds,
-        )
-        response.raise_for_status()
-        spreads = response.json()
+        spreads: dict[str, Any] = {}
+        for token_batch in _chunk_values(values=token_ids, max_batch_size=MAX_CLOB_SPREADS_BATCH_SIZE):
+            payload = [{"token_id": token_id} for token_id in token_batch]
+            response = self.session.post(
+                f"{CLOB_API}/spreads",
+                json=payload,
+                timeout=self.config.timeout_seconds,
+            )
+            response.raise_for_status()
+            spreads.update(response.json())
+
         wrapped = [self._wrap_record("clob_spreads", {"token_ids": token_ids, "result": spreads})]
         path = self.writer.write("clob_spreads", wrapped)
         return spreads, path
@@ -283,23 +294,33 @@ class PolymarketCollector:
         interval: str = "1h",
         fidelity: int = 1,
     ) -> tuple[dict[str, Any], Path | None]:
-        payload: dict[str, Any] = {
+        history: dict[str, Any] = {}
+        for token_batch in _chunk_values(values=token_ids, max_batch_size=MAX_CLOB_BATCH_HISTORY_BATCH_SIZE):
+            payload: dict[str, Any] = {
+                "markets": token_batch,
+                "interval": interval,
+                "fidelity": fidelity,
+            }
+            if start_ts is not None:
+                payload["start_ts"] = start_ts
+            if end_ts is not None:
+                payload["end_ts"] = end_ts
+
+            response = self.session.post(
+                f"{CLOB_API}/batch-prices-history",
+                json=payload,
+                timeout=self.config.timeout_seconds,
+            )
+            response.raise_for_status()
+            history = _merge_dict_results(history, response.json())
+
+        payload = {
             "markets": token_ids,
             "interval": interval,
             "fidelity": fidelity,
+            **({"start_ts": start_ts} if start_ts is not None else {}),
+            **({"end_ts": end_ts} if end_ts is not None else {}),
         }
-        if start_ts is not None:
-            payload["start_ts"] = start_ts
-        if end_ts is not None:
-            payload["end_ts"] = end_ts
-
-        response = self.session.post(
-            f"{CLOB_API}/batch-prices-history",
-            json=payload,
-            timeout=self.config.timeout_seconds,
-        )
-        response.raise_for_status()
-        history = response.json()
         wrapped = [self._wrap_record("clob_batch_prices_history", {"request": payload, "result": history})]
         path = self.writer.write("clob_batch_prices_history", wrapped)
         return history, path
@@ -493,6 +514,28 @@ def _chunk_joined_values(*, values: list[str], max_joined_chars: int) -> list[li
     if current:
         chunks.append(current)
     return chunks
+
+
+def _chunk_values(*, values: list[str], max_batch_size: int) -> list[list[str]]:
+    if not values:
+        return []
+    size = max(1, max_batch_size)
+    return [values[index : index + size] for index in range(0, len(values), size)]
+
+
+def _merge_dict_results(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
+    if not left:
+        return dict(right)
+
+    merged = dict(left)
+    for key, value in right.items():
+        if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
+            nested = dict(merged[key])
+            nested.update(value)
+            merged[key] = nested
+            continue
+        merged[key] = value
+    return merged
 
 
 def _build_pyclob_client(clob_driver: str):
