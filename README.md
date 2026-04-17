@@ -101,8 +101,12 @@ python -m polymarket_collector run-primary \
   --node-id local-primary \
   --interval-seconds 300 \
   --discover-all-pages \
+  --freeze-tracked-markets \
+  --full-trades-for-tracked-markets \
   --page-limit 500 \
   --max-markets-for-trades 500 \
+  --trade-page-limit 500 \
+  --trade-max-offset 10000 \
   --max-markets-for-oi-holders 1000 \
   --max-assets-for-books 2000 \
   --hot-assets-for-books 300 \
@@ -145,7 +149,7 @@ PM_DATA_ROOT=data_run4 PM_DURATION_SECONDS=21600 PM_LOG_FILE=run_primary_run4.lo
 
 脚本默认值（与代码一致）：
 
-- `PM_DATA_ROOT=data_run3`
+- `PM_DATA_ROOT=data`
 - `PM_BUCKET_SECONDS=3600`
 - `PM_WRITER_NODE_ID=cloud-test`
 - `PM_NODE_ID=cloud-test`
@@ -153,6 +157,8 @@ PM_DATA_ROOT=data_run4 PM_DURATION_SECONDS=21600 PM_LOG_FILE=run_primary_run4.lo
 - `PM_DURATION_SECONDS=43200`（12 小时）
 - `PM_PAGE_LIMIT=500`
 - `PM_MAX_MARKETS_FOR_TRADES=500`
+- `PM_TRADE_PAGE_LIMIT=500`
+- `PM_TRADE_MAX_OFFSET=10000`
 - `PM_MAX_MARKETS_FOR_OI_HOLDERS=1000`
 - `PM_MAX_ASSETS_FOR_BOOKS=5000`
 - `PM_HOT_ASSETS_FOR_BOOKS=1500`
@@ -166,6 +172,8 @@ PM_DATA_ROOT=data_run4 PM_DURATION_SECONDS=21600 PM_LOG_FILE=run_primary_run4.lo
 - `PM_MAX_ASSETS_FOR_WS=800`
 - `PM_WS_DURATION_SECONDS=55`
 - `PM_NEW_MARKET_BACKFILL_SECONDS=3600`
+- `PM_FREEZE_TRACKED_MARKETS=1`
+- `PM_FULL_TRADES_FOR_TRACKED_MARKETS=1`
 - `PM_LOG_FILE=run_primary_12h_rich.log`
 - `PM_PID_FILE=.primary.pid`
 - `PM_KILL_EXISTING=1`
@@ -233,6 +241,8 @@ data/raw/source=<source>/dt=YYYY-MM-DD/hour=HH/bucket_start=YYYYMMDDTHHMMSSZ_nod
 <data-root>/state/heartbeat_<node>.json
 <data-root>/state/failover_state.json
 <data-root>/state/market_universe.json
+<data-root>/state/tracked_market_selection.json
+<data-root>/state/trade_frontier.json
 <data-root>/state/reports/dedup_report_*.json
 ```
 
@@ -255,12 +265,15 @@ ws_market
 
 - `--clob-driver pyclob` 只影响 CLOB 相关调用；缺依赖会快速失败。
 - 盘口采样采用冷热分层频率，降低全量抓取压力。
+- `--freeze-tracked-markets` 会把跟踪集合持久化到 `tracked_market_selection.json`：保留仍然 active 的旧市场顺序，自动追加新 active 市场，自动移除 inactive/closed 市场。
+- `--full-trades-for-tracked-markets` 会对固定市场集合做分页增量同步，并把已追到的交易前沿写进 `trade_frontier.json`，用于重启后续抓。
 - `clob_batch_prices_history` 对时间参数有约束：当请求带 `start_ts/end_ts` 时，采集器会规范化 `interval` 为 `all`，并在必要时重试不带 `interval` 的请求。
 - writer 使用固定时间桶（默认 `3600` 秒）；跨机主备建议统一 `bucket_seconds` 和 `writer_node_id`。
 - `build-parquet` 从 `data/raw` 读取并写入 `data/warehouse`，已有文件默认跳过，`--overwrite` 可覆盖。
 
 ## 最近关键变更（按提交记录）
 
+- `HEAD`：新增固定跟踪市场集合和交易增量全量抓取前沿状态。
 - `ee2b379`：修复历史价格参数规范化，避免 `/batch-prices-history` 400。
 - `ef5d85c`：修复一键脚本在“无旧进程”场景下的退出问题。
 - `695a2de`：新增 `scripts/start_primary.sh` 一键启动脚本。

@@ -246,6 +246,10 @@ def main() -> int:
             discover_all_pages=args.discover_all_pages,
             page_limit=args.page_limit,
             new_market_backfill_seconds=args.new_market_backfill_seconds,
+            freeze_tracked_markets=args.freeze_tracked_markets,
+            full_trades_for_tracked_markets=args.full_trades_for_tracked_markets,
+            trade_page_limit=args.trade_page_limit,
+            trade_max_offset=args.trade_max_offset,
         )
         print("run_primary_completed=true")
         return 0
@@ -276,6 +280,10 @@ def main() -> int:
             discover_all_pages=args.discover_all_pages,
             page_limit=args.page_limit,
             new_market_backfill_seconds=args.new_market_backfill_seconds,
+            freeze_tracked_markets=args.freeze_tracked_markets,
+            full_trades_for_tracked_markets=args.full_trades_for_tracked_markets,
+            trade_page_limit=args.trade_page_limit,
+            trade_max_offset=args.trade_max_offset,
         )
         print("run_backup_completed=true")
         return 0
@@ -524,6 +532,28 @@ def build_parser() -> argparse.ArgumentParser:
         default=1800,
         help="History window used to bootstrap newly discovered tokens",
     )
+    primary.add_argument(
+        "--freeze-tracked-markets",
+        action="store_true",
+        help="Persist tracked condition IDs and asset IDs across cycles, appending new active markets and dropping inactive ones while preserving order",
+    )
+    primary.add_argument(
+        "--full-trades-for-tracked-markets",
+        action="store_true",
+        help="Paginate trades for tracked markets and persist trade-frontier state for incremental full capture",
+    )
+    primary.add_argument(
+        "--trade-page-limit",
+        type=int,
+        default=500,
+        help="Trade page size for recent fetches or incremental pagination",
+    )
+    primary.add_argument(
+        "--trade-max-offset",
+        type=int,
+        default=10000,
+        help="Maximum offset walked during one incremental trade sync",
+    )
 
     backup = subparsers.add_parser("run-backup", help="Run backup failover loop")
     backup.add_argument("--node-id", default="cloud-backup", help="Backup node id")
@@ -605,6 +635,28 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1800,
         help="History window used to bootstrap newly discovered tokens",
+    )
+    backup.add_argument(
+        "--freeze-tracked-markets",
+        action="store_true",
+        help="Persist tracked condition IDs and asset IDs across cycles, appending new active markets and dropping inactive ones while preserving order",
+    )
+    backup.add_argument(
+        "--full-trades-for-tracked-markets",
+        action="store_true",
+        help="Paginate trades for tracked markets and persist trade-frontier state for incremental full capture",
+    )
+    backup.add_argument(
+        "--trade-page-limit",
+        type=int,
+        default=500,
+        help="Trade page size for recent fetches or incremental pagination",
+    )
+    backup.add_argument(
+        "--trade-max-offset",
+        type=int,
+        default=10000,
+        help="Maximum offset walked during one incremental trade sync",
     )
 
     return parser

@@ -26,6 +26,8 @@ INTERVAL_SECONDS="${PM_INTERVAL_SECONDS:-60}"
 DURATION_SECONDS="${PM_DURATION_SECONDS:-43200}"
 PAGE_LIMIT="${PM_PAGE_LIMIT:-500}"
 MAX_MARKETS_FOR_TRADES="${PM_MAX_MARKETS_FOR_TRADES:-500}"
+TRADE_PAGE_LIMIT="${PM_TRADE_PAGE_LIMIT:-500}"
+TRADE_MAX_OFFSET="${PM_TRADE_MAX_OFFSET:-10000}"
 MAX_MARKETS_FOR_OI_HOLDERS="${PM_MAX_MARKETS_FOR_OI_HOLDERS:-1000}"
 MAX_ASSETS_FOR_BOOKS="${PM_MAX_ASSETS_FOR_BOOKS:-5000}"
 HOT_ASSETS_FOR_BOOKS="${PM_HOT_ASSETS_FOR_BOOKS:-1500}"
@@ -39,6 +41,8 @@ HISTORY_FIDELITY="${PM_HISTORY_FIDELITY:-1}"
 MAX_ASSETS_FOR_WS="${PM_MAX_ASSETS_FOR_WS:-800}"
 WS_DURATION_SECONDS="${PM_WS_DURATION_SECONDS:-55}"
 NEW_MARKET_BACKFILL_SECONDS="${PM_NEW_MARKET_BACKFILL_SECONDS:-3600}"
+FREEZE_TRACKED_MARKETS="${PM_FREEZE_TRACKED_MARKETS:-1}"
+FULL_TRADES_FOR_TRACKED_MARKETS="${PM_FULL_TRADES_FOR_TRACKED_MARKETS:-1}"
 LOG_FILE="${PM_LOG_FILE:-run_primary_12h_rich.log}"
 PID_FILE="${PM_PID_FILE:-.primary.pid}"
 KILL_EXISTING="${PM_KILL_EXISTING:-1}"
@@ -61,6 +65,16 @@ fi
 
 mkdir -p "${DATA_ROOT}"
 
+freeze_tracked_markets_flag=()
+if [[ "${FREEZE_TRACKED_MARKETS}" == "1" ]]; then
+  freeze_tracked_markets_flag+=(--freeze-tracked-markets)
+fi
+
+full_trades_for_tracked_markets_flag=()
+if [[ "${FULL_TRADES_FOR_TRACKED_MARKETS}" == "1" ]]; then
+  full_trades_for_tracked_markets_flag+=(--full-trades-for-tracked-markets)
+fi
+
 nohup python -m polymarket_collector \
   --data-root "${DATA_ROOT}" \
   --bucket-seconds "${BUCKET_SECONDS}" \
@@ -73,6 +87,8 @@ nohup python -m polymarket_collector \
   --discover-all-pages \
   --page-limit "${PAGE_LIMIT}" \
   --max-markets-for-trades "${MAX_MARKETS_FOR_TRADES}" \
+  --trade-page-limit "${TRADE_PAGE_LIMIT}" \
+  --trade-max-offset "${TRADE_MAX_OFFSET}" \
   --max-markets-for-oi-holders "${MAX_MARKETS_FOR_OI_HOLDERS}" \
   --max-assets-for-books "${MAX_ASSETS_FOR_BOOKS}" \
   --hot-assets-for-books "${HOT_ASSETS_FOR_BOOKS}" \
@@ -86,6 +102,8 @@ nohup python -m polymarket_collector \
   --max-assets-for-ws "${MAX_ASSETS_FOR_WS}" \
   --ws-duration-seconds "${WS_DURATION_SECONDS}" \
   --new-market-backfill-seconds "${NEW_MARKET_BACKFILL_SECONDS}" \
+  "${freeze_tracked_markets_flag[@]}" \
+  "${full_trades_for_tracked_markets_flag[@]}" \
   > "${LOG_FILE}" 2>&1 &
 
 pid="$!"

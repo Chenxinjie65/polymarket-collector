@@ -35,6 +35,8 @@ DATA_API = "https://data-api.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
 MARKET_WSS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 MAX_TRADE_MARKET_QUERY_CHARS = 3000
+MAX_TRADE_PAGE_LIMIT = 500
+MAX_TRADE_PAGE_OFFSET = 10000
 MAX_DATA_MARKETS_BATCH_SIZE = 100
 MAX_CLOB_BOOKS_BATCH_SIZE = 100
 MAX_CLOB_MIDPOINTS_BATCH_SIZE = 200
@@ -258,9 +260,27 @@ class PolymarketCollector:
         self,
         *,
         condition_ids: list[str] | None = None,
-        limit: int = 500,
+        limit: int = MAX_TRADE_PAGE_LIMIT,
         taker_only: bool = False,
     ) -> tuple[list[dict[str, Any]], Path | None]:
+        trades = self.fetch_trades_page(
+            condition_ids=condition_ids,
+            limit=limit,
+            offset=0,
+            taker_only=taker_only,
+        )
+        wrapped = [self._wrap_record("data_trades", trade) for trade in trades]
+        path = self.writer.write("data_trades", wrapped)
+        return trades, path
+
+    def fetch_trades_page(
+        self,
+        *,
+        condition_ids: list[str] | None = None,
+        limit: int = MAX_TRADE_PAGE_LIMIT,
+        offset: int = 0,
+        taker_only: bool = False,
+    ) -> list[dict[str, Any]]:
         market_batches = _chunk_joined_values(
             values=condition_ids or [],
             max_joined_chars=MAX_TRADE_MARKET_QUERY_CHARS,
@@ -270,7 +290,11 @@ class PolymarketCollector:
 
         trades: list[dict[str, Any]] = []
         for market_batch in market_batches:
-            params: dict[str, Any] = {"limit": limit, "takerOnly": str(taker_only).lower()}
+            params: dict[str, Any] = {
+                "limit": limit,
+                "offset": offset,
+                "takerOnly": str(taker_only).lower(),
+            }
             if market_batch:
                 params["market"] = ",".join(market_batch)
 
@@ -282,9 +306,63 @@ class PolymarketCollector:
             response.raise_for_status()
             trades.extend(response.json())
 
+        return trades
+
+    def fetch_trades_incremental(
+        self,
+        *,
+        condition_ids: list[str],
+        frontier_by_condition: dict[str, Any] | None = None,
+        page_limit: int = MAX_TRADE_PAGE_LIMIT,
+        max_offset: int = MAX_TRADE_PAGE_OFFSET,
+        taker_only: bool = False,
+    ) -> tuple[list[dict[str, Any]], Path | None, dict[str, Any], bool]:
+        frontier = _normalize_trade_frontier_state(frontier_by_condition)
+        page_size = min(max(1, page_limit), MAX_TRADE_PAGE_LIMIT)
+        max_page_offset = max(0, min(max_offset, MAX_TRADE_PAGE_OFFSET))
+        trades: list[dict[str, Any]] = []
+        hit_offset_cap = False
+
+        market_batches = _chunk_joined_values(
+            values=condition_ids,
+            max_joined_chars=MAX_TRADE_MARKET_QUERY_CHARS,
+        )
+        if not market_batches:
+            return [], None, frontier, False
+
+        for market_batch in market_batches:
+            offset = 0
+            while True:
+                page = self.fetch_trades_page(
+                    condition_ids=market_batch,
+                    limit=page_size,
+                    offset=offset,
+                    taker_only=taker_only,
+                )
+                if not page:
+                    break
+
+                new_page_trades = [
+                    trade for trade in page if _is_new_trade_record(trade=trade, frontier=frontier)
+                ]
+                if new_page_trades:
+                    trades.extend(new_page_trades)
+                    frontier = _update_trade_frontier(frontier=frontier, trades=new_page_trades)
+
+                if len(page) < page_size:
+                    break
+                if not new_page_trades:
+                    break
+
+                next_offset = offset + page_size
+                if next_offset > max_page_offset:
+                    hit_offset_cap = True
+                    break
+                offset = next_offset
+
         wrapped = [self._wrap_record("data_trades", trade) for trade in trades]
         path = self.writer.write("data_trades", wrapped)
-        return trades, path
+        return trades, path, frontier, hit_offset_cap
 
     def fetch_books(self, *, token_ids: list[str]) -> tuple[list[dict[str, Any]], Path | None]:
         books: list[dict[str, Any]] = []
@@ -652,6 +730,105 @@ def _chunk_values(*, values: list[str], max_batch_size: int) -> list[list[str]]:
         return []
     size = max(1, max_batch_size)
     return [values[index : index + size] for index in range(0, len(values), size)]
+
+
+def _normalize_trade_frontier_state(frontier_by_condition: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    normalized: dict[str, dict[str, Any]] = {}
+    for condition_id, raw in (frontier_by_condition or {}).items():
+        if not isinstance(condition_id, str) or not condition_id:
+            continue
+        if not isinstance(raw, dict):
+            continue
+        max_timestamp = raw.get("max_timestamp")
+        if not isinstance(max_timestamp, int):
+            continue
+        keys_at_max_timestamp = raw.get("keys_at_max_timestamp") or []
+        normalized[condition_id] = {
+            "max_timestamp": max_timestamp,
+            "keys_at_max_timestamp": sorted(
+                str(key)
+                for key in keys_at_max_timestamp
+                if isinstance(key, str) and key
+            ),
+        }
+    return normalized
+
+
+def _is_new_trade_record(*, trade: dict[str, Any], frontier: dict[str, dict[str, Any]]) -> bool:
+    condition_id = trade.get("conditionId")
+    if not isinstance(condition_id, str) or not condition_id:
+        return True
+
+    timestamp = trade.get("timestamp")
+    if not isinstance(timestamp, int):
+        return True
+
+    state = frontier.get(condition_id)
+    if state is None:
+        return True
+    if timestamp > state["max_timestamp"]:
+        return True
+    if timestamp < state["max_timestamp"]:
+        return False
+    return _trade_record_key(trade) not in set(state["keys_at_max_timestamp"])
+
+
+def _update_trade_frontier(
+    *,
+    frontier: dict[str, dict[str, Any]],
+    trades: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    updated = {
+        condition_id: {
+            "max_timestamp": int(state["max_timestamp"]),
+            "keys_at_max_timestamp": list(state["keys_at_max_timestamp"]),
+        }
+        for condition_id, state in frontier.items()
+    }
+
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for trade in trades:
+        condition_id = trade.get("conditionId")
+        timestamp = trade.get("timestamp")
+        if not isinstance(condition_id, str) or not condition_id or not isinstance(timestamp, int):
+            continue
+        grouped.setdefault(condition_id, []).append(trade)
+
+    for condition_id, condition_trades in grouped.items():
+        max_timestamp = max(int(trade["timestamp"]) for trade in condition_trades)
+        new_keys = {
+            _trade_record_key(trade)
+            for trade in condition_trades
+            if int(trade["timestamp"]) == max_timestamp
+        }
+
+        existing = updated.get(condition_id)
+        if existing is None or max_timestamp > existing["max_timestamp"]:
+            updated[condition_id] = {
+                "max_timestamp": max_timestamp,
+                "keys_at_max_timestamp": sorted(new_keys),
+            }
+            continue
+        if max_timestamp == existing["max_timestamp"]:
+            merged_keys = set(existing["keys_at_max_timestamp"])
+            merged_keys.update(new_keys)
+            existing["keys_at_max_timestamp"] = sorted(merged_keys)
+
+    return updated
+
+
+def _trade_record_key(trade: dict[str, Any]) -> str:
+    return "|".join(
+        [
+            str(trade.get("transactionHash", "")),
+            str(trade.get("asset", "")),
+            str(trade.get("conditionId", "")),
+            str(trade.get("side", "")),
+            str(trade.get("timestamp", "")),
+            str(trade.get("price", "")),
+            str(trade.get("size", "")),
+        ]
+    )
 
 
 def _build_batch_prices_history_payload(
