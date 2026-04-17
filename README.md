@@ -215,6 +215,18 @@ python -m polymarket_collector run-backup \
   --ws-duration-seconds 20
 ```
 
+One-command startup script (activates `.venv`, optionally stops old `run-primary`, and starts new run):
+
+```bash
+bash scripts/start_primary.sh
+```
+
+Common overrides:
+
+```bash
+PM_DATA_ROOT=data_run4 PM_DURATION_SECONDS=21600 PM_LOG_FILE=run_primary_run4.log bash scripts/start_primary.sh
+```
+
 `run-primary` and `run-backup` now persist market universe state at:
 
 ```text
