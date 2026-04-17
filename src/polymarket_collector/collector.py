@@ -39,7 +39,8 @@ MAX_DATA_MARKETS_BATCH_SIZE = 100
 MAX_CLOB_BOOKS_BATCH_SIZE = 100
 MAX_CLOB_MIDPOINTS_BATCH_SIZE = 200
 MAX_CLOB_SPREADS_BATCH_SIZE = 200
-MAX_CLOB_BATCH_HISTORY_BATCH_SIZE = 100
+# /batch-prices-history currently accepts at most 20 market ids per request.
+MAX_CLOB_BATCH_HISTORY_BATCH_SIZE = 20
 
 
 @dataclass(slots=True)
@@ -348,23 +349,14 @@ class PolymarketCollector:
     ) -> tuple[dict[str, Any], Path | None]:
         history: dict[str, Any] = {}
         for token_batch in _chunk_values(values=token_ids, max_batch_size=MAX_CLOB_BATCH_HISTORY_BATCH_SIZE):
-            payload: dict[str, Any] = {
-                "markets": token_batch,
-                "interval": interval,
-                "fidelity": fidelity,
-            }
-            if start_ts is not None:
-                payload["start_ts"] = start_ts
-            if end_ts is not None:
-                payload["end_ts"] = end_ts
-
-            response = self.session.post(
-                f"{CLOB_API}/batch-prices-history",
-                json=payload,
-                timeout=self.config.timeout_seconds,
+            batch_result = self._fetch_batch_prices_history_chunk(
+                token_ids=token_batch,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                interval=interval,
+                fidelity=fidelity,
             )
-            response.raise_for_status()
-            history = _merge_dict_results(history, response.json())
+            history = _merge_dict_results(history, batch_result)
 
         payload = {
             "markets": token_ids,
@@ -376,6 +368,55 @@ class PolymarketCollector:
         wrapped = [self._wrap_record("clob_batch_prices_history", {"request": payload, "result": history})]
         path = self.writer.write("clob_batch_prices_history", wrapped)
         return history, path
+
+    def _fetch_batch_prices_history_chunk(
+        self,
+        *,
+        token_ids: list[str],
+        start_ts: int | None,
+        end_ts: int | None,
+        interval: str,
+        fidelity: int,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "markets": token_ids,
+            "interval": interval,
+            "fidelity": fidelity,
+        }
+        if start_ts is not None:
+            payload["start_ts"] = start_ts
+        if end_ts is not None:
+            payload["end_ts"] = end_ts
+
+        response = self.session.post(
+            f"{CLOB_API}/batch-prices-history",
+            json=payload,
+            timeout=self.config.timeout_seconds,
+        )
+        try:
+            response.raise_for_status()
+        except requests.HTTPError:
+            # If payload constraints change upstream, split the chunk recursively
+            # so one bad batch does not fail the entire collection cycle.
+            if response.status_code == 400 and len(token_ids) > 1:
+                middle = len(token_ids) // 2
+                left = self._fetch_batch_prices_history_chunk(
+                    token_ids=token_ids[:middle],
+                    start_ts=start_ts,
+                    end_ts=end_ts,
+                    interval=interval,
+                    fidelity=fidelity,
+                )
+                right = self._fetch_batch_prices_history_chunk(
+                    token_ids=token_ids[middle:],
+                    start_ts=start_ts,
+                    end_ts=end_ts,
+                    interval=interval,
+                    fidelity=fidelity,
+                )
+                return _merge_dict_results(left, right)
+            raise
+        return response.json()
 
     def fetch_open_interest(
         self,
