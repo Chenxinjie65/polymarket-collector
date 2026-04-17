@@ -44,13 +44,13 @@ PID_FILE="${PM_PID_FILE:-.primary.pid}"
 KILL_EXISTING="${PM_KILL_EXISTING:-1}"
 
 if [[ "${KILL_EXISTING}" == "1" ]]; then
-  existing_pids="$(ps -ef | grep 'python -m polymarket_collector' | grep 'run-primary' | grep -v grep | awk '{print $2}')"
+  existing_pids="$(ps -ef | grep 'python -m polymarket_collector' | grep 'run-primary' | grep -v grep | awk '{print $2}' || true)"
   if [[ -n "${existing_pids}" ]]; then
     echo "info: stopping existing run-primary pids: ${existing_pids}"
     # shellcheck disable=SC2086
     kill ${existing_pids} || true
     sleep 2
-    alive_pids="$(ps -ef | grep 'python -m polymarket_collector' | grep 'run-primary' | grep -v grep | awk '{print $2}')"
+    alive_pids="$(ps -ef | grep 'python -m polymarket_collector' | grep 'run-primary' | grep -v grep | awk '{print $2}' || true)"
     if [[ -n "${alive_pids}" ]]; then
       echo "info: force stopping pids: ${alive_pids}"
       # shellcheck disable=SC2086
