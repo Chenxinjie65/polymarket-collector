@@ -415,8 +415,15 @@ class PolymarketCollector:
                     fidelity=fidelity,
                 )
                 return _merge_dict_results(left, right)
+            if response.status_code == 400 and len(token_ids) == 1:
+                # Some assets can be unsupported for this endpoint.
+                # Skip single bad assets and keep partial results flowing.
+                return {}
             raise
-        return response.json()
+        payload = response.json()
+        if isinstance(payload, dict) and isinstance(payload.get("history"), dict):
+            return payload["history"]
+        return payload
 
     def fetch_open_interest(
         self,
