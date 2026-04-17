@@ -1,0 +1,17 @@
+# folders
+node_modules/
+lib
+broadcast/
+
+*.log
+*.tgz
+
+.env
+.env.*
+!.env.example
+
+cache
+coverage*
+.vscode
+dist
+out

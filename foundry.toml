@@ -1,0 +1,10 @@
+[profile.default]
+src = "src"
+test = "test"
+script = "script"
+out = "out"
+libs = ["lib"]
+cache_path = "cache_forge"
+solc_version = "0.8.20"
+fs_permissions = [{ access = "read-write", path = "./" }]
+

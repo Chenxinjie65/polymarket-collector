@@ -1,0 +1,2 @@
+"""Minimal Polymarket collector package."""
+

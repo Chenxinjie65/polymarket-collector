@@ -1,0 +1,30 @@
+{
+    "name": "@polymarket/uma-ctf-adapter",
+    "description": "Contracts to resolve Polymarket prediction markets via UMA's Optimistic Oracle",
+    "version": "3.0.0",
+    "contributors": [
+        {
+            "name": "Jonathan Amenechi",
+            "url": "https://github.com/JonathanAmenechi"
+        },
+        {
+            "name": "Liam Kovatch",
+            "url": "https://github.com/L-Kov"
+        }
+    ],
+    "keywords": [
+        "blockchain",
+        "ethereum",
+        "hardhat",
+        "smart-contracts",
+        "solidity"
+    ],
+    "license": "MIT",
+    "scripts": {
+        "test": "forge test"
+    },
+    "devDependencies": {
+        "prettier": "^2.5.1",
+        "prettier-plugin-solidity": "^1.0.0-beta.19"
+    }
+}
