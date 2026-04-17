@@ -12,6 +12,12 @@ Current capabilities:
 
 ## Quick start
 
+If you cloned this repository from GitHub, initialize submodules first:
+
+```bash
+git submodule update --init --recursive
+```
+
 Create a virtual environment and install dependencies:
 
 ```bash

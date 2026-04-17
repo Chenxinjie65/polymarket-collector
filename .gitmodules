@@ -1,0 +1,21 @@
+[submodule "lib/conditional-tokens-contracts"]
+	path = lib/conditional-tokens-contracts
+	url = https://github.com/gnosis/conditional-tokens-contracts.git
+[submodule "lib/ctf-exchange"]
+	path = lib/ctf-exchange
+	url = https://github.com/Polymarket/ctf-exchange.git
+[submodule "lib/neg-risk-ctf-adapter"]
+	path = lib/neg-risk-ctf-adapter
+	url = https://github.com/Polymarket/neg-risk-ctf-adapter.git
+[submodule "lib/safe-smart-account"]
+	path = lib/safe-smart-account
+	url = https://github.com/safe-global/safe-smart-account.git
+[submodule "lib/protocol"]
+	path = lib/protocol
+	url = https://github.com/UMAprotocol/protocol.git
+[submodule "lib/proxy-factories"]
+	path = lib/proxy-factories
+	url = https://github.com/Polymarket/proxy-factories.git
+[submodule "lib/uma-ctf-adapter"]
+	path = lib/uma-ctf-adapter
+	url = https://github.com/Polymarket/uma-ctf-adapter.git
