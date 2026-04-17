@@ -18,7 +18,7 @@ if ! python -c "import polymarket_collector" >/dev/null 2>&1; then
   python -m pip install -e ".[pyclob]"
 fi
 
-DATA_ROOT="${PM_DATA_ROOT:-data_run3}"
+DATA_ROOT="${PM_DATA_ROOT:-data}"
 BUCKET_SECONDS="${PM_BUCKET_SECONDS:-3600}"
 WRITER_NODE_ID="${PM_WRITER_NODE_ID:-cloud-test}"
 NODE_ID="${PM_NODE_ID:-cloud-test}"
