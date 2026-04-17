@@ -21,6 +21,7 @@ class UniverseState:
 class SnapshotScheduleState:
     last_hot_snapshot_at: float = 0.0
     last_cold_snapshot_at: float = 0.0
+    last_history_snapshot_at: float = 0.0
 
 
 def run_primary_loop(
@@ -32,10 +33,16 @@ def run_primary_loop(
     duration_seconds: int,
     market_limit: int,
     max_markets_for_trades: int,
+    max_markets_for_oi_holders: int,
     max_assets_for_books: int,
     hot_assets_for_books: int,
     hot_snapshot_interval_seconds: int,
     cold_snapshot_interval_seconds: int,
+    max_assets_for_history: int,
+    history_snapshot_interval_seconds: int,
+    history_window_seconds: int,
+    history_interval: str,
+    history_fidelity: int,
     max_assets_for_ws: int,
     ws_duration_seconds: int,
     discover_all_pages: bool,
@@ -55,15 +62,28 @@ def run_primary_loop(
                 page_limit=page_limit,
             )
             _write_latest_markets(data_root, markets)
+            event_count, event_warnings = _discover_events_for_cycle(
+                collector=collector,
+                data_root=data_root,
+                discover_all_pages=discover_all_pages,
+                market_limit=market_limit,
+                page_limit=page_limit,
+            )
             cycle_state = _collect_cycle(
                 collector=collector,
                 markets=markets,
                 previous_state=universe_state,
                 max_markets_for_trades=max_markets_for_trades,
+                max_markets_for_oi_holders=max_markets_for_oi_holders,
                 max_assets_for_books=max_assets_for_books,
                 hot_assets_for_books=hot_assets_for_books,
                 hot_snapshot_interval_seconds=hot_snapshot_interval_seconds,
                 cold_snapshot_interval_seconds=cold_snapshot_interval_seconds,
+                max_assets_for_history=max_assets_for_history,
+                history_snapshot_interval_seconds=history_snapshot_interval_seconds,
+                history_window_seconds=history_window_seconds,
+                history_interval=history_interval,
+                history_fidelity=history_fidelity,
                 max_assets_for_ws=max_assets_for_ws,
                 ws_duration_seconds=ws_duration_seconds,
                 new_market_backfill_seconds=new_market_backfill_seconds,
@@ -81,13 +101,16 @@ def run_primary_loop(
                     "mode": "collecting",
                     "cycle_ts": datetime.now(UTC).isoformat(),
                     "markets_count": len(markets),
+                    "events_count": event_count,
                     "condition_ids_count": len(universe_state.condition_ids),
                     "asset_ids_count": len(universe_state.asset_ids),
                     "new_condition_ids_count": cycle_state["new_condition_ids_count"],
                     "new_asset_ids_count": cycle_state["new_asset_ids_count"],
+                    "oi_holders_market_count": cycle_state["oi_holders_market_count"],
                     "books_hot_snapshot_count": cycle_state["books_hot_snapshot_count"],
                     "books_cold_snapshot_count": cycle_state["books_cold_snapshot_count"],
-                    "collection_warnings": cycle_state["collection_warnings"],
+                    "history_snapshot_asset_count": cycle_state["history_snapshot_asset_count"],
+                    "collection_warnings": event_warnings + cycle_state["collection_warnings"],
                     "bootstrap_warnings": cycle_state["bootstrap_warnings"],
                 },
             )
@@ -124,10 +147,16 @@ def run_backup_loop(
     duration_seconds: int,
     market_limit: int,
     max_markets_for_trades: int,
+    max_markets_for_oi_holders: int,
     max_assets_for_books: int,
     hot_assets_for_books: int,
     hot_snapshot_interval_seconds: int,
     cold_snapshot_interval_seconds: int,
+    max_assets_for_history: int,
+    history_snapshot_interval_seconds: int,
+    history_window_seconds: int,
+    history_interval: str,
+    history_fidelity: int,
     max_assets_for_ws: int,
     ws_duration_seconds: int,
     discover_all_pages: bool,
@@ -153,15 +182,28 @@ def run_backup_loop(
                     page_limit=page_limit,
                 )
                 _write_latest_markets(data_root, markets)
+                event_count, event_warnings = _discover_events_for_cycle(
+                    collector=collector,
+                    data_root=data_root,
+                    discover_all_pages=discover_all_pages,
+                    market_limit=market_limit,
+                    page_limit=page_limit,
+                )
                 cycle_state = _collect_cycle(
                     collector=collector,
                     markets=markets,
                     previous_state=universe_state,
                     max_markets_for_trades=max_markets_for_trades,
+                    max_markets_for_oi_holders=max_markets_for_oi_holders,
                     max_assets_for_books=max_assets_for_books,
                     hot_assets_for_books=hot_assets_for_books,
                     hot_snapshot_interval_seconds=hot_snapshot_interval_seconds,
                     cold_snapshot_interval_seconds=cold_snapshot_interval_seconds,
+                    max_assets_for_history=max_assets_for_history,
+                    history_snapshot_interval_seconds=history_snapshot_interval_seconds,
+                    history_window_seconds=history_window_seconds,
+                    history_interval=history_interval,
+                    history_fidelity=history_fidelity,
                     max_assets_for_ws=max_assets_for_ws,
                     ws_duration_seconds=ws_duration_seconds,
                     new_market_backfill_seconds=new_market_backfill_seconds,
@@ -180,13 +222,16 @@ def run_backup_loop(
                         "failover_decision": decision,
                         "cycle_ts": datetime.now(UTC).isoformat(),
                         "markets_count": len(markets),
+                        "events_count": event_count,
                         "condition_ids_count": len(universe_state.condition_ids),
                         "asset_ids_count": len(universe_state.asset_ids),
                         "new_condition_ids_count": cycle_state["new_condition_ids_count"],
                         "new_asset_ids_count": cycle_state["new_asset_ids_count"],
+                        "oi_holders_market_count": cycle_state["oi_holders_market_count"],
                         "books_hot_snapshot_count": cycle_state["books_hot_snapshot_count"],
                         "books_cold_snapshot_count": cycle_state["books_cold_snapshot_count"],
-                        "collection_warnings": cycle_state["collection_warnings"],
+                        "history_snapshot_asset_count": cycle_state["history_snapshot_asset_count"],
+                        "collection_warnings": event_warnings + cycle_state["collection_warnings"],
                         "bootstrap_warnings": cycle_state["bootstrap_warnings"],
                     },
                 )
@@ -231,6 +276,13 @@ def _write_latest_markets(data_root: Path, markets: list[dict[str, Any]]) -> Pat
     return latest_path
 
 
+def _write_latest_events(data_root: Path, events: list[dict[str, Any]]) -> Path:
+    data_root.mkdir(parents=True, exist_ok=True)
+    latest_path = data_root / "latest_events.json"
+    latest_path.write_text(json.dumps(events, ensure_ascii=True, indent=2), encoding="utf-8")
+    return latest_path
+
+
 def _discover_markets_for_cycle(
     *,
     collector: PolymarketCollector,
@@ -244,16 +296,41 @@ def _discover_markets_for_cycle(
     return markets
 
 
+def _discover_events_for_cycle(
+    *,
+    collector: PolymarketCollector,
+    data_root: Path,
+    discover_all_pages: bool,
+    market_limit: int,
+    page_limit: int,
+) -> tuple[int, list[str]]:
+    try:
+        if discover_all_pages:
+            events = collector.discover_events_all_pages(page_limit=page_limit)
+        else:
+            events, _ = collector.discover_events(limit=market_limit)
+        _write_latest_events(data_root, events)
+        return len(events), []
+    except Exception as exc:  # noqa: BLE001
+        return 0, [f"discover_events_failed:{exc}"]
+
+
 def _collect_cycle(
     *,
     collector: PolymarketCollector,
     markets: list[dict[str, Any]],
     previous_state: UniverseState,
     max_markets_for_trades: int,
+    max_markets_for_oi_holders: int,
     max_assets_for_books: int,
     hot_assets_for_books: int,
     hot_snapshot_interval_seconds: int,
     cold_snapshot_interval_seconds: int,
+    max_assets_for_history: int,
+    history_snapshot_interval_seconds: int,
+    history_window_seconds: int,
+    history_interval: str,
+    history_fidelity: int,
     max_assets_for_ws: int,
     ws_duration_seconds: int,
     new_market_backfill_seconds: int,
@@ -291,6 +368,34 @@ def _collect_cycle(
         books_hot_snapshot_count = 0
         books_cold_snapshot_count = 0
         collection_warnings.append(f"book_snapshot_failed:{exc}")
+
+    oi_holders_market_count = max(0, min(max_markets_for_oi_holders, len(condition_ids)))
+    if oi_holders_market_count > 0:
+        oi_condition_ids = condition_ids[:oi_holders_market_count]
+        try:
+            collector.fetch_open_interest(condition_ids=oi_condition_ids)
+        except Exception as exc:  # noqa: BLE001
+            collection_warnings.append(f"fetch_open_interest_failed:{exc}")
+
+        try:
+            collector.fetch_holders(condition_ids=oi_condition_ids)
+        except Exception as exc:  # noqa: BLE001
+            collection_warnings.append(f"fetch_holders_failed:{exc}")
+
+    try:
+        history_snapshot_asset_count = _collect_history_snapshots(
+            collector=collector,
+            asset_ids=asset_ids,
+            max_assets_for_history=max_assets_for_history,
+            history_snapshot_interval_seconds=history_snapshot_interval_seconds,
+            history_window_seconds=history_window_seconds,
+            history_interval=history_interval,
+            history_fidelity=history_fidelity,
+            snapshot_state=snapshot_state,
+        )
+    except Exception as exc:  # noqa: BLE001
+        history_snapshot_asset_count = 0
+        collection_warnings.append(f"history_snapshot_failed:{exc}")
 
     if asset_ids[:max_assets_for_ws]:
         try:
@@ -339,8 +444,10 @@ def _collect_cycle(
         "current_state": current_state,
         "new_condition_ids_count": len(new_condition_ids),
         "new_asset_ids_count": len(new_asset_ids),
+        "oi_holders_market_count": oi_holders_market_count,
         "books_hot_snapshot_count": books_hot_snapshot_count,
         "books_cold_snapshot_count": books_cold_snapshot_count,
+        "history_snapshot_asset_count": history_snapshot_asset_count,
         "collection_warnings": collection_warnings,
         "bootstrap_warnings": bootstrap_warnings,
     }
@@ -387,6 +494,42 @@ def _collect_tiered_book_snapshots(
         snapshot_state.last_cold_snapshot_at = now
 
     return len(hot_assets) if hot_due else 0, len(cold_assets) if cold_due else 0
+
+
+def _collect_history_snapshots(
+    *,
+    collector: PolymarketCollector,
+    asset_ids: list[str],
+    max_assets_for_history: int,
+    history_snapshot_interval_seconds: int,
+    history_window_seconds: int,
+    history_interval: str,
+    history_fidelity: int,
+    snapshot_state: SnapshotScheduleState,
+) -> int:
+    assets = asset_ids[:max_assets_for_history]
+    if not assets or history_snapshot_interval_seconds <= 0:
+        return 0
+
+    now = time.monotonic()
+    due = (
+        snapshot_state.last_history_snapshot_at <= 0
+        or now - snapshot_state.last_history_snapshot_at >= max(history_snapshot_interval_seconds, 1)
+    )
+    if not due:
+        return 0
+
+    now_ts = int(datetime.now(UTC).timestamp())
+    start_ts = now_ts - max(history_window_seconds, 60)
+    collector.fetch_batch_prices_history(
+        token_ids=assets,
+        start_ts=start_ts,
+        end_ts=now_ts,
+        interval=history_interval,
+        fidelity=history_fidelity,
+    )
+    snapshot_state.last_history_snapshot_at = now
+    return len(assets)
 
 
 def _load_universe_state(data_root: Path) -> UniverseState:

@@ -108,7 +108,7 @@ python -m polymarket_collector backfill-from-dir \
   --from-root /mnt/cloud-buffer/data \
   --start 2026-04-17T00:00:00Z \
   --end 2026-04-17T06:00:00Z \
-  --sources data_trades,ws_market,clob_books
+  --sources gamma_markets,gamma_events,data_trades,data_oi,data_holders,clob_books,clob_midpoints,clob_spreads,clob_batch_prices_history,ws_market
 ```
 
 Build a duplicate-rate report for one source and time window:
@@ -144,15 +144,19 @@ python -m polymarket_collector run-primary \
   --duration-seconds 70 \
   --market-limit 10 \
   --max-markets-for-trades 5 \
+  --max-markets-for-oi-holders 5 \
   --max-assets-for-books 5 \
   --hot-assets-for-books 3 \
   --hot-snapshot-interval-seconds 20 \
   --cold-snapshot-interval-seconds 60 \
+  --max-assets-for-history 5 \
+  --history-snapshot-interval-seconds 60 \
+  --history-window-seconds 600 \
   --max-assets-for-ws 5 \
   --ws-duration-seconds 20
 ```
 
-Enable automatic full active-market scan and new-market bootstrap:
+Enable automatic full active-market scan and detailed raw collection:
 
 ```bash
 python -m polymarket_collector run-primary \
@@ -160,11 +164,32 @@ python -m polymarket_collector run-primary \
   --interval-seconds 300 \
   --discover-all-pages \
   --page-limit 500 \
+  --max-markets-for-trades 500 \
+  --max-markets-for-oi-holders 1000 \
   --max-assets-for-books 2000 \
   --hot-assets-for-books 300 \
   --hot-snapshot-interval-seconds 30 \
   --cold-snapshot-interval-seconds 300 \
+  --max-assets-for-history 1000 \
+  --history-snapshot-interval-seconds 1800 \
+  --history-window-seconds 3600 \
+  --history-interval 1m \
   --new-market-backfill-seconds 1800
+```
+
+This mode continuously writes these raw sources when the upstream APIs respond successfully:
+
+```text
+gamma_markets
+gamma_events
+data_trades
+data_oi
+data_holders
+clob_books
+clob_midpoints
+clob_spreads
+clob_batch_prices_history
+ws_market
 ```
 
 Run backup failover loop (example: monitor and collect only when primary is stale):
@@ -178,10 +203,14 @@ python -m polymarket_collector run-backup \
   --duration-seconds 120 \
   --market-limit 10 \
   --max-markets-for-trades 5 \
+  --max-markets-for-oi-holders 5 \
   --max-assets-for-books 5 \
   --hot-assets-for-books 3 \
   --hot-snapshot-interval-seconds 20 \
   --cold-snapshot-interval-seconds 60 \
+  --max-assets-for-history 5 \
+  --history-snapshot-interval-seconds 60 \
+  --history-window-seconds 600 \
   --max-assets-for-ws 5 \
   --ws-duration-seconds 20
 ```
@@ -208,6 +237,8 @@ data/raw/source=<source>/dt=YYYY-MM-DD/hour=HH/bucket_start=YYYYMMDDTHHMMSSZ_nod
 - The failover tools assume local and cloud collectors use the same partition convention.
 - `--clob-driver pyclob` only affects CLOB calls; if the extra dependency is not installed, the command fails fast.
 - Book snapshots are now tiered by frequency: hot assets use `--hot-snapshot-interval-seconds`, cold assets use `--cold-snapshot-interval-seconds`.
+- Periodic `gamma_events`, `data_oi`, `data_holders`, and `clob_batch_prices_history` collection is built into `run-primary` and `run-backup`.
+- Use heartbeat fields such as `events_count`, `oi_holders_market_count`, `history_snapshot_asset_count`, `collection_warnings`, and `bootstrap_warnings` to confirm which sources were collected in the latest cycle.
 - Writer now uses fixed time buckets (default `--bucket-seconds 3600`). Use `--bucket-seconds 86400` for daily bucket files.
 - Use the same `--bucket-seconds` and `--writer-node-id` convention on both machines for clean failover sync.
 - `build-parquet` reads from `data/raw` and writes mirrored parquet paths into `data/warehouse`; existing parquet files are skipped unless `--overwrite` is set.

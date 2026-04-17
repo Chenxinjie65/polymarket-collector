@@ -35,6 +35,7 @@ DATA_API = "https://data-api.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
 MARKET_WSS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 MAX_TRADE_MARKET_QUERY_CHARS = 3000
+MAX_DATA_MARKETS_BATCH_SIZE = 100
 MAX_CLOB_BOOKS_BATCH_SIZE = 100
 MAX_CLOB_MIDPOINTS_BATCH_SIZE = 200
 MAX_CLOB_SPREADS_BATCH_SIZE = 200
@@ -201,6 +202,57 @@ class PolymarketCollector:
         path = self.writer.write("gamma_events", wrapped)
         return events, path
 
+    def discover_events_all_pages(
+        self,
+        *,
+        page_limit: int = 500,
+        active: bool = True,
+        closed: bool = False,
+        archived: bool = False,
+        max_pages: int = 200,
+    ) -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+        offset = 0
+        seen_ids: set[str] = set()
+        page_count = 0
+
+        while page_count < max_pages:
+            response = self.session.get(
+                f"{GAMMA_API}/events",
+                params={
+                    "limit": page_limit,
+                    "offset": offset,
+                    "active": str(active).lower(),
+                    "closed": str(closed).lower(),
+                    "archived": str(archived).lower(),
+                },
+                timeout=self.config.timeout_seconds,
+            )
+            response.raise_for_status()
+            page = response.json()
+            if not page:
+                break
+
+            dedup_page = []
+            for item in page:
+                event_id = item.get("id")
+                key = str(event_id) if event_id is not None else json.dumps(item, sort_keys=True)
+                if key in seen_ids:
+                    continue
+                seen_ids.add(key)
+                dedup_page.append(item)
+
+            events.extend(dedup_page)
+            page_count += 1
+
+            if len(page) < page_limit:
+                break
+            offset += page_limit
+
+        wrapped = [self._wrap_record("gamma_events", event) for event in events]
+        self.writer.write("gamma_events", wrapped)
+        return events
+
     def fetch_trades(
         self,
         *,
@@ -330,16 +382,23 @@ class PolymarketCollector:
         *,
         condition_ids: list[str] | None = None,
     ) -> tuple[list[dict[str, Any]], Path | None]:
-        params: dict[str, Any] = {}
-        if condition_ids:
-            params["market"] = condition_ids
-        response = self.session.get(
-            f"{DATA_API}/oi",
-            params=params or None,
-            timeout=self.config.timeout_seconds,
-        )
-        response.raise_for_status()
-        values = response.json()
+        market_batches = _chunk_values(values=condition_ids or [], max_batch_size=MAX_DATA_MARKETS_BATCH_SIZE)
+        if not market_batches:
+            market_batches = [None]
+
+        values: list[dict[str, Any]] = []
+        for market_batch in market_batches:
+            params: dict[str, Any] = {}
+            if market_batch:
+                params["market"] = market_batch
+            response = self.session.get(
+                f"{DATA_API}/oi",
+                params=params or None,
+                timeout=self.config.timeout_seconds,
+            )
+            response.raise_for_status()
+            values.extend(response.json())
+
         wrapped = [self._wrap_record("data_oi", item) for item in values]
         path = self.writer.write("data_oi", wrapped)
         return values, path
@@ -349,16 +408,23 @@ class PolymarketCollector:
         *,
         condition_ids: list[str] | None = None,
     ) -> tuple[list[dict[str, Any]], Path | None]:
-        params: dict[str, Any] = {}
-        if condition_ids:
-            params["market"] = condition_ids
-        response = self.session.get(
-            f"{DATA_API}/holders",
-            params=params or None,
-            timeout=self.config.timeout_seconds,
-        )
-        response.raise_for_status()
-        holders = response.json()
+        market_batches = _chunk_values(values=condition_ids or [], max_batch_size=MAX_DATA_MARKETS_BATCH_SIZE)
+        if not market_batches:
+            market_batches = [None]
+
+        holders: list[dict[str, Any]] = []
+        for market_batch in market_batches:
+            params: dict[str, Any] = {}
+            if market_batch:
+                params["market"] = market_batch
+            response = self.session.get(
+                f"{DATA_API}/holders",
+                params=params or None,
+                timeout=self.config.timeout_seconds,
+            )
+            response.raise_for_status()
+            holders.extend(response.json())
+
         wrapped = [self._wrap_record("data_holders", item) for item in holders]
         path = self.writer.write("data_holders", wrapped)
         return holders, path

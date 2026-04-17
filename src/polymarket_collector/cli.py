@@ -231,10 +231,16 @@ def main() -> int:
             duration_seconds=args.duration_seconds,
             market_limit=args.market_limit,
             max_markets_for_trades=args.max_markets_for_trades,
+            max_markets_for_oi_holders=args.max_markets_for_oi_holders,
             max_assets_for_books=args.max_assets_for_books,
             hot_assets_for_books=args.hot_assets_for_books,
             hot_snapshot_interval_seconds=args.hot_snapshot_interval_seconds,
             cold_snapshot_interval_seconds=args.cold_snapshot_interval_seconds,
+            max_assets_for_history=args.max_assets_for_history,
+            history_snapshot_interval_seconds=args.history_snapshot_interval_seconds,
+            history_window_seconds=args.history_window_seconds,
+            history_interval=args.history_interval,
+            history_fidelity=args.history_fidelity,
             max_assets_for_ws=args.max_assets_for_ws,
             ws_duration_seconds=args.ws_duration_seconds,
             discover_all_pages=args.discover_all_pages,
@@ -255,10 +261,16 @@ def main() -> int:
             duration_seconds=args.duration_seconds,
             market_limit=args.market_limit,
             max_markets_for_trades=args.max_markets_for_trades,
+            max_markets_for_oi_holders=args.max_markets_for_oi_holders,
             max_assets_for_books=args.max_assets_for_books,
             hot_assets_for_books=args.hot_assets_for_books,
             hot_snapshot_interval_seconds=args.hot_snapshot_interval_seconds,
             cold_snapshot_interval_seconds=args.cold_snapshot_interval_seconds,
+            max_assets_for_history=args.max_assets_for_history,
+            history_snapshot_interval_seconds=args.history_snapshot_interval_seconds,
+            history_window_seconds=args.history_window_seconds,
+            history_interval=args.history_interval,
+            history_fidelity=args.history_fidelity,
             max_assets_for_ws=args.max_assets_for_ws,
             ws_duration_seconds=args.ws_duration_seconds,
             discover_all_pages=args.discover_all_pages,
@@ -388,7 +400,10 @@ def build_parser() -> argparse.ArgumentParser:
     backfill.add_argument("--end", required=True, help="End time ISO8601, e.g. 2026-04-17T06:00:00Z")
     backfill.add_argument(
         "--sources",
-        default="gamma_markets,data_trades,clob_books,ws_market",
+        default=(
+            "gamma_markets,gamma_events,data_trades,data_oi,data_holders,"
+            "clob_books,clob_midpoints,clob_spreads,clob_batch_prices_history,ws_market"
+        ),
         help="Comma-separated sources",
     )
     backfill.add_argument("--dry-run", action="store_true", help="Only report planned copy operations")
@@ -397,7 +412,18 @@ def build_parser() -> argparse.ArgumentParser:
     dedup.add_argument(
         "--source",
         required=True,
-        choices=("gamma_markets", "data_trades", "clob_books", "ws_market"),
+        choices=(
+            "gamma_markets",
+            "gamma_events",
+            "data_trades",
+            "data_oi",
+            "data_holders",
+            "clob_books",
+            "clob_midpoints",
+            "clob_spreads",
+            "clob_batch_prices_history",
+            "ws_market",
+        ),
         help="Raw source name",
     )
     dedup.add_argument("--start", required=True, help="Start time ISO8601")
@@ -426,6 +452,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=20,
         help="Max condition IDs used in one trade fetch",
     )
+    primary.add_argument(
+        "--max-markets-for-oi-holders",
+        type=int,
+        default=300,
+        help="Max condition IDs used for open-interest and holder snapshots each cycle",
+    )
     primary.add_argument("--max-assets-for-books", type=int, default=20, help="Max assets for book snapshots")
     primary.add_argument(
         "--hot-assets-for-books",
@@ -444,6 +476,35 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=300,
         help="Snapshot interval for cold assets",
+    )
+    primary.add_argument(
+        "--max-assets-for-history",
+        type=int,
+        default=300,
+        help="Max assets used for periodic price-history snapshots",
+    )
+    primary.add_argument(
+        "--history-snapshot-interval-seconds",
+        type=int,
+        default=1800,
+        help="Snapshot interval for batch price history; set 0 to disable",
+    )
+    primary.add_argument(
+        "--history-window-seconds",
+        type=int,
+        default=3600,
+        help="Lookback window for each batch price-history snapshot",
+    )
+    primary.add_argument(
+        "--history-interval",
+        default="1m",
+        help="Interval passed to batch price history",
+    )
+    primary.add_argument(
+        "--history-fidelity",
+        type=int,
+        default=1,
+        help="Fidelity passed to batch price history",
     )
     primary.add_argument("--max-assets-for-ws", type=int, default=10, help="Max assets for WS stream")
     primary.add_argument("--ws-duration-seconds", type=int, default=60, help="WS duration per cycle")
@@ -473,6 +534,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=20,
         help="Max condition IDs used in one trade fetch",
     )
+    backup.add_argument(
+        "--max-markets-for-oi-holders",
+        type=int,
+        default=300,
+        help="Max condition IDs used for open-interest and holder snapshots each active cycle",
+    )
     backup.add_argument("--max-assets-for-books", type=int, default=20, help="Max assets for book snapshots")
     backup.add_argument(
         "--hot-assets-for-books",
@@ -491,6 +558,35 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=300,
         help="Snapshot interval for cold assets when backup is active",
+    )
+    backup.add_argument(
+        "--max-assets-for-history",
+        type=int,
+        default=300,
+        help="Max assets used for periodic price-history snapshots when backup is active",
+    )
+    backup.add_argument(
+        "--history-snapshot-interval-seconds",
+        type=int,
+        default=1800,
+        help="Snapshot interval for batch price history when backup is active; set 0 to disable",
+    )
+    backup.add_argument(
+        "--history-window-seconds",
+        type=int,
+        default=3600,
+        help="Lookback window for each backup price-history snapshot",
+    )
+    backup.add_argument(
+        "--history-interval",
+        default="1m",
+        help="Interval passed to backup batch price history",
+    )
+    backup.add_argument(
+        "--history-fidelity",
+        type=int,
+        default=1,
+        help="Fidelity passed to backup batch price history",
     )
     backup.add_argument("--max-assets-for-ws", type=int, default=10, help="Max assets for WS stream")
     backup.add_argument("--ws-duration-seconds", type=int, default=60, help="WS duration per active cycle")
