@@ -430,7 +430,7 @@ def _collect_cycle(
 
     # 1) Normal cycle collection for current known universe.
     try:
-        tracked_trade_condition_ids = tracked_condition_ids[:max_markets_for_trades]
+        tracked_trade_condition_ids = _limit_items(tracked_condition_ids, max_markets_for_trades)
         if tracked_trade_condition_ids:
             if full_trades_for_tracked_markets:
                 _, _, trade_frontier, hit_trade_offset_cap = collector.fetch_trades_incremental(
@@ -468,9 +468,9 @@ def _collect_cycle(
         books_cold_snapshot_count = 0
         collection_warnings.append(f"book_snapshot_failed:{exc}")
 
-    oi_holders_market_count = max(0, min(max_markets_for_oi_holders, len(tracked_condition_ids)))
+    oi_condition_ids = _limit_items(tracked_condition_ids, max_markets_for_oi_holders)
+    oi_holders_market_count = len(oi_condition_ids)
     if oi_holders_market_count > 0:
-        oi_condition_ids = tracked_condition_ids[:oi_holders_market_count]
         try:
             collector.fetch_open_interest(condition_ids=oi_condition_ids)
         except Exception as exc:  # noqa: BLE001
@@ -496,10 +496,11 @@ def _collect_cycle(
         history_snapshot_asset_count = 0
         collection_warnings.append(f"history_snapshot_failed:{exc}")
 
-    if tracked_asset_ids[:max_assets_for_ws]:
+    ws_asset_ids = _limit_items(tracked_asset_ids, max_assets_for_ws)
+    if ws_asset_ids:
         try:
             collector.stream_market(
-                asset_ids=tracked_asset_ids[:max_assets_for_ws],
+                asset_ids=ws_asset_ids,
                 duration_seconds=ws_duration_seconds,
                 on_new_market=lambda event: _update_tracked_selection_from_ws_event(
                     selection=tracked_selection,
@@ -519,7 +520,7 @@ def _collect_cycle(
     bootstrap_trade_condition_ids = tracked_added_condition_ids if freeze_tracked_markets else new_condition_ids
     if bootstrap_trade_condition_ids:
         try:
-            bootstrap_trade_condition_ids = bootstrap_trade_condition_ids[:max_markets_for_trades]
+            bootstrap_trade_condition_ids = _limit_items(bootstrap_trade_condition_ids, max_markets_for_trades)
             if full_trades_for_tracked_markets:
                 _, _, trade_frontier, hit_trade_offset_cap = collector.fetch_trades_incremental(
                     condition_ids=bootstrap_trade_condition_ids,
@@ -542,7 +543,7 @@ def _collect_cycle(
     bootstrap_warnings: list[str] = []
     bootstrap_asset_ids = tracked_added_asset_ids if freeze_tracked_markets else new_asset_ids
     if bootstrap_asset_ids:
-        bootstrap_assets = bootstrap_asset_ids[:max_assets_for_books]
+        bootstrap_assets = _limit_items(bootstrap_asset_ids, max_assets_for_books)
         try:
             collector.fetch_books(token_ids=bootstrap_assets)
             if collect_midpoints:
@@ -552,12 +553,13 @@ def _collect_cycle(
         except Exception as exc:  # noqa: BLE001
             bootstrap_warnings.append(f"bootstrap_books_failed:{exc}")
 
-        if max_assets_for_history > 0 and new_market_backfill_seconds > 0:
+        bootstrap_history_assets = _limit_items(bootstrap_assets, max_assets_for_history)
+        if bootstrap_history_assets and new_market_backfill_seconds > 0:
             now_ts = int(datetime.now(UTC).timestamp())
             start_ts = now_ts - max(new_market_backfill_seconds, 60)
             try:
                 collector.fetch_batch_prices_history(
-                    token_ids=bootstrap_assets[:max_assets_for_history],
+                    token_ids=bootstrap_history_assets,
                     start_ts=start_ts,
                     end_ts=now_ts,
                     interval="1m",
@@ -599,7 +601,7 @@ def _collect_tiered_book_snapshots(
     collect_midpoints: bool,
     collect_spreads: bool,
 ) -> tuple[int, int]:
-    assets = asset_ids[:max_assets_for_books]
+    assets = _limit_items(asset_ids, max_assets_for_books)
     if not assets:
         return 0, 0
 
@@ -647,7 +649,7 @@ def _collect_history_snapshots(
     history_fidelity: int,
     snapshot_state: SnapshotScheduleState,
 ) -> int:
-    assets = asset_ids[:max_assets_for_history]
+    assets = _limit_items(asset_ids, max_assets_for_history)
     if not assets or history_snapshot_interval_seconds <= 0:
         return 0
 
@@ -670,6 +672,12 @@ def _collect_history_snapshots(
     )
     snapshot_state.last_history_snapshot_at = now
     return len(assets)
+
+
+def _limit_items(values: list[str], limit: int) -> list[str]:
+    if limit <= 0:
+        return list(values)
+    return values[:limit]
 
 
 def _load_universe_state(data_root: Path) -> UniverseState:

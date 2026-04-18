@@ -594,6 +594,7 @@ class PolymarketCollector:
         custom_feature_enabled: bool = True,
         flush_every_messages: int = 50,
         flush_every_seconds: int = 5,
+        subscribe_batch_size: int = 500,
         on_new_market: Callable[[dict[str, Any]], None] | None = None,
         on_market_resolved: Callable[[dict[str, Any]], None] | None = None,
     ) -> int:
@@ -606,12 +607,13 @@ class PolymarketCollector:
         ws = websocket.create_connection(MARKET_WSS, timeout=self.config.timeout_seconds)
         try:
             ws.settimeout(min(self.config.timeout_seconds, 5))
-            subscribe_message = {
-                "assets_ids": asset_ids,
-                "type": "market",
-                "custom_feature_enabled": custom_feature_enabled,
-            }
-            ws.send(json.dumps(subscribe_message))
+            for batch in _chunk_values(values=asset_ids, max_batch_size=max(1, subscribe_batch_size)):
+                subscribe_message = {
+                    "assets_ids": batch,
+                    "type": "market",
+                    "custom_feature_enabled": custom_feature_enabled,
+                }
+                ws.send(json.dumps(subscribe_message))
 
             start = time.monotonic()
             message_count = 0
@@ -640,15 +642,19 @@ class PolymarketCollector:
                             new_assets = _extract_ws_assets_ids(event)
                             new_subscriptions = [asset_id for asset_id in new_assets if asset_id not in subscribed_asset_ids]
                             if new_subscriptions:
-                                ws.send(
-                                    json.dumps(
-                                        {
-                                            "assets_ids": new_subscriptions,
-                                            "operation": "subscribe",
-                                            "custom_feature_enabled": custom_feature_enabled,
-                                        }
+                                for batch in _chunk_values(
+                                    values=new_subscriptions,
+                                    max_batch_size=max(1, subscribe_batch_size),
+                                ):
+                                    ws.send(
+                                        json.dumps(
+                                            {
+                                                "assets_ids": batch,
+                                                "operation": "subscribe",
+                                                "custom_feature_enabled": custom_feature_enabled,
+                                            }
+                                        )
                                     )
-                                )
                                 subscribed_asset_ids.update(new_subscriptions)
                             if on_new_market is not None:
                                 on_new_market(event)
@@ -656,14 +662,18 @@ class PolymarketCollector:
                             resolved_assets = _extract_ws_assets_ids(event)
                             unsubscribe_assets = [asset_id for asset_id in resolved_assets if asset_id in subscribed_asset_ids]
                             if unsubscribe_assets:
-                                ws.send(
-                                    json.dumps(
-                                        {
-                                            "assets_ids": unsubscribe_assets,
-                                            "operation": "unsubscribe",
-                                        }
+                                for batch in _chunk_values(
+                                    values=unsubscribe_assets,
+                                    max_batch_size=max(1, subscribe_batch_size),
+                                ):
+                                    ws.send(
+                                        json.dumps(
+                                            {
+                                                "assets_ids": batch,
+                                                "operation": "unsubscribe",
+                                            }
+                                        )
                                     )
-                                )
                                 subscribed_asset_ids.difference_update(unsubscribe_assets)
                             if on_market_resolved is not None:
                                 on_market_resolved(event)
@@ -697,7 +707,7 @@ class PolymarketCollector:
             asset_ids.extend(normalized)
 
         deduped = list(dict.fromkeys(asset_ids))
-        if max_assets is not None:
+        if max_assets is not None and max_assets > 0:
             return deduped[:max_assets]
         return deduped
 

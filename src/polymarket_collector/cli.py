@@ -53,7 +53,7 @@ def main() -> int:
 
     if args.command == "fetch-trades":
         markets = _load_markets_file(Path(args.data_root), args.markets_file)
-        condition_ids = collector.extract_condition_ids(markets)[: args.max_markets]
+        condition_ids = _limit_values(collector.extract_condition_ids(markets), args.max_markets)
         trades, path = collector.fetch_trades(
             condition_ids=condition_ids or None,
             limit=args.limit,
@@ -109,7 +109,7 @@ def main() -> int:
 
     if args.command == "fetch-oi":
         markets = _load_markets_file(Path(args.data_root), args.markets_file)
-        condition_ids = collector.extract_condition_ids(markets)[: args.max_markets]
+        condition_ids = _limit_values(collector.extract_condition_ids(markets), args.max_markets)
         values, path = collector.fetch_open_interest(condition_ids=condition_ids or None)
         print(f"fetched_oi={len(values)}")
         if path:
@@ -118,7 +118,7 @@ def main() -> int:
 
     if args.command == "fetch-holders":
         markets = _load_markets_file(Path(args.data_root), args.markets_file)
-        condition_ids = collector.extract_condition_ids(markets)[: args.max_markets]
+        condition_ids = _limit_values(collector.extract_condition_ids(markets), args.max_markets)
         values, path = collector.fetch_holders(condition_ids=condition_ids or None)
         print(f"fetched_holders={len(values)}")
         if path:
@@ -332,7 +332,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-markets",
         type=int,
         default=20,
-        help="Maximum number of market condition IDs to query in one call",
+        help="Maximum number of market condition IDs to query in one call; <=0 means all",
     )
     trades.add_argument(
         "--taker-only",
@@ -342,19 +342,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     books = subparsers.add_parser("fetch-books", help="Fetch order book snapshots")
     books.add_argument("--markets-file", default="latest", help="Path to markets JSON or 'latest'")
-    books.add_argument("--max-assets", type=int, default=20, help="Maximum number of asset IDs")
+    books.add_argument("--max-assets", type=int, default=20, help="Maximum number of asset IDs; <=0 means all")
 
     midpoints = subparsers.add_parser("fetch-midpoints", help="Fetch midpoint snapshots")
     midpoints.add_argument("--markets-file", default="latest", help="Path to markets JSON or 'latest'")
-    midpoints.add_argument("--max-assets", type=int, default=20, help="Maximum number of asset IDs")
+    midpoints.add_argument("--max-assets", type=int, default=20, help="Maximum number of asset IDs; <=0 means all")
 
     spreads = subparsers.add_parser("fetch-spreads", help="Fetch spread snapshots")
     spreads.add_argument("--markets-file", default="latest", help="Path to markets JSON or 'latest'")
-    spreads.add_argument("--max-assets", type=int, default=20, help="Maximum number of asset IDs")
+    spreads.add_argument("--max-assets", type=int, default=20, help="Maximum number of asset IDs; <=0 means all")
 
     history = subparsers.add_parser("fetch-prices-history", help="Fetch batch price history")
     history.add_argument("--markets-file", default="latest", help="Path to markets JSON or 'latest'")
-    history.add_argument("--max-assets", type=int, default=20, help="Maximum number of asset IDs")
+    history.add_argument("--max-assets", type=int, default=20, help="Maximum number of asset IDs; <=0 means all")
     history.add_argument("--start-ts", type=int, default=None, help="Unix start timestamp")
     history.add_argument("--end-ts", type=int, default=None, help="Unix end timestamp")
     history.add_argument(
@@ -366,15 +366,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     oi = subparsers.add_parser("fetch-oi", help="Fetch open interest")
     oi.add_argument("--markets-file", default="latest", help="Path to markets JSON or 'latest'")
-    oi.add_argument("--max-markets", type=int, default=20, help="Maximum market condition IDs")
+    oi.add_argument("--max-markets", type=int, default=20, help="Maximum market condition IDs; <=0 means all")
 
     holders = subparsers.add_parser("fetch-holders", help="Fetch holders")
     holders.add_argument("--markets-file", default="latest", help="Path to markets JSON or 'latest'")
-    holders.add_argument("--max-markets", type=int, default=20, help="Maximum market condition IDs")
+    holders.add_argument("--max-markets", type=int, default=20, help="Maximum market condition IDs; <=0 means all")
 
     stream = subparsers.add_parser("stream-market", help="Stream public market WebSocket")
     stream.add_argument("--markets-file", default="latest", help="Path to markets JSON or 'latest'")
-    stream.add_argument("--max-assets", type=int, default=10, help="Maximum number of asset IDs")
+    stream.add_argument("--max-assets", type=int, default=10, help="Maximum number of asset IDs; <=0 means all")
     stream.add_argument("--duration-seconds", type=int, default=60, help="Streaming duration")
 
     hb = subparsers.add_parser("heartbeat", help="Write one heartbeat state file")
@@ -466,15 +466,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-markets-for-trades",
         type=int,
         default=20,
-        help="Max condition IDs used in one trade fetch",
+        help="Max condition IDs used in one trade fetch; <=0 means all tracked markets",
     )
     primary.add_argument(
         "--max-markets-for-oi-holders",
         type=int,
         default=300,
-        help="Max condition IDs used for open-interest and holder snapshots each cycle",
+        help="Max condition IDs used for open-interest and holder snapshots each cycle; <=0 means all tracked markets",
     )
-    primary.add_argument("--max-assets-for-books", type=int, default=20, help="Max assets for book snapshots")
+    primary.add_argument(
+        "--max-assets-for-books",
+        type=int,
+        default=20,
+        help="Max assets for book snapshots; <=0 means all tracked assets",
+    )
     primary.add_argument(
         "--hot-assets-for-books",
         type=int,
@@ -497,7 +502,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-assets-for-history",
         type=int,
         default=0,
-        help="Max assets used for periodic price-history snapshots",
+        help="Max assets used for periodic price-history snapshots; <=0 means all tracked assets",
     )
     primary.add_argument(
         "--history-snapshot-interval-seconds",
@@ -522,7 +527,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=1,
         help="Fidelity passed to batch price history",
     )
-    primary.add_argument("--max-assets-for-ws", type=int, default=10, help="Max assets for WS stream")
+    primary.add_argument("--max-assets-for-ws", type=int, default=0, help="Max assets for WS stream; <=0 means all")
     primary.add_argument("--ws-duration-seconds", type=int, default=60, help="WS duration per cycle")
     primary.add_argument(
         "--discover-all-pages",
@@ -580,15 +585,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-markets-for-trades",
         type=int,
         default=20,
-        help="Max condition IDs used in one trade fetch",
+        help="Max condition IDs used in one trade fetch; <=0 means all tracked markets",
     )
     backup.add_argument(
         "--max-markets-for-oi-holders",
         type=int,
         default=300,
-        help="Max condition IDs used for open-interest and holder snapshots each active cycle",
+        help="Max condition IDs used for open-interest and holder snapshots each active cycle; <=0 means all tracked markets",
     )
-    backup.add_argument("--max-assets-for-books", type=int, default=20, help="Max assets for book snapshots")
+    backup.add_argument(
+        "--max-assets-for-books",
+        type=int,
+        default=20,
+        help="Max assets for book snapshots; <=0 means all tracked assets",
+    )
     backup.add_argument(
         "--hot-assets-for-books",
         type=int,
@@ -611,7 +621,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-assets-for-history",
         type=int,
         default=0,
-        help="Max assets used for periodic price-history snapshots when backup is active",
+        help="Max assets used for periodic price-history snapshots when backup is active; <=0 means all tracked assets",
     )
     backup.add_argument(
         "--history-snapshot-interval-seconds",
@@ -636,7 +646,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=1,
         help="Fidelity passed to backup batch price history",
     )
-    backup.add_argument("--max-assets-for-ws", type=int, default=10, help="Max assets for WS stream")
+    backup.add_argument("--max-assets-for-ws", type=int, default=0, help="Max assets for WS stream; <=0 means all")
     backup.add_argument("--ws-duration-seconds", type=int, default=60, help="WS duration per active cycle")
     backup.add_argument(
         "--discover-all-pages",
@@ -726,6 +736,12 @@ def _parse_json_object(value: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("--extra-json must be a JSON object")
     return payload
+
+
+def _limit_values(values: list[str], limit: int) -> list[str]:
+    if limit <= 0:
+        return list(values)
+    return values[:limit]
 
 
 def _write_report(data_root: Path, payload: dict[str, Any], *, prefix: str) -> Path:

@@ -1,5 +1,7 @@
 # Polymarket Data Platform Implementation Plan
 
+> Note: this is an architecture planning document with forward-looking design. For current implemented behavior, runtime defaults, and operational commands, treat `README.md` and `scripts/start_primary.sh` as authoritative.
+
 ## 1. Goal
 
 Build a production-grade Polymarket data platform that:

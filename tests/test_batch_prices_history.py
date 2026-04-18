@@ -122,6 +122,7 @@ class BatchPricesHistoryTests(unittest.TestCase):
         args = parser.parse_args(["run-primary"])
         self.assertEqual(args.history_interval, "all")
         self.assertEqual(args.max_assets_for_history, 0)
+        self.assertEqual(args.max_assets_for_ws, 0)
         self.assertEqual(args.history_snapshot_interval_seconds, 0)
         self.assertEqual(args.new_market_backfill_seconds, 0)
         self.assertFalse(args.collect_midpoints)

@@ -1,5 +1,7 @@
 # Polymarket 数据平台实施规划
 
+> 说明：本文件是架构规划文档，包含前瞻性设计。当前仓库“已实现行为、参数默认值、脚本用法”以 `README.md` 和 `scripts/start_primary.sh` 为准。
+
 ## 1. 项目目标
 
 构建一个面向生产环境的 Polymarket 数据平台，使其能够：

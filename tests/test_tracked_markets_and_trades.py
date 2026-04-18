@@ -284,6 +284,161 @@ class TrackedMarketsAndTradesTests(unittest.TestCase):
         self.assertEqual(selection.condition_ids, ["cond-a"])
         self.assertEqual(selection.asset_ids, ["tok-a-1", "tok-a-2"])
 
+    def test_collect_cycle_treats_zero_limits_as_unbounded(self) -> None:
+        class DummyCollector:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, list[str]]] = []
+
+            @staticmethod
+            def extract_condition_ids(markets: list[dict[str, object]]) -> list[str]:
+                return [str(m["conditionId"]) for m in markets]
+
+            @staticmethod
+            def extract_asset_ids(markets: list[dict[str, object]]) -> list[str]:
+                values: list[str] = []
+                for market in markets:
+                    values.extend(list(market["clobTokenIds"]))
+                return values
+
+            def fetch_trades_incremental(self, **kwargs):
+                self.calls.append(("fetch_trades_incremental", list(kwargs["condition_ids"])))
+                return [], None, {}, False
+
+            def fetch_open_interest(self, **kwargs):
+                self.calls.append(("fetch_open_interest", list(kwargs["condition_ids"])))
+
+            def fetch_holders(self, **kwargs):
+                self.calls.append(("fetch_holders", list(kwargs["condition_ids"])))
+
+            def fetch_books(self, **kwargs):
+                self.calls.append(("fetch_books", list(kwargs["token_ids"])))
+
+            def fetch_batch_prices_history(self, **kwargs):
+                self.calls.append(("fetch_batch_prices_history", list(kwargs["token_ids"])))
+
+            def stream_market(self, **kwargs):
+                self.calls.append(("stream_market", list(kwargs["asset_ids"])))
+
+        collector = DummyCollector()
+        tracked = TrackedMarketSelection(
+            condition_ids=["cond-a", "cond-b"],
+            asset_ids=["tok-a-1", "tok-a-2", "tok-b-1", "tok-b-2"],
+            added_condition_ids=[],
+            added_asset_ids=[],
+        )
+        markets = [
+            {"conditionId": "cond-a", "clobTokenIds": ["tok-a-1", "tok-a-2"]},
+            {"conditionId": "cond-b", "clobTokenIds": ["tok-b-1", "tok-b-2"]},
+        ]
+        _collect_cycle(
+            collector=collector,
+            markets=markets,
+            previous_state=UniverseState(condition_ids=set(), asset_ids=set()),
+            max_markets_for_trades=0,
+            max_markets_for_oi_holders=0,
+            max_assets_for_books=0,
+            hot_assets_for_books=0,
+            hot_snapshot_interval_seconds=300,
+            cold_snapshot_interval_seconds=300,
+            max_assets_for_history=0,
+            history_snapshot_interval_seconds=0,
+            history_window_seconds=900,
+            history_interval="all",
+            history_fidelity=1,
+            max_assets_for_ws=0,
+            ws_duration_seconds=5,
+            new_market_backfill_seconds=0,
+            snapshot_state=SnapshotScheduleState(),
+            tracked_selection=tracked,
+            freeze_tracked_markets=True,
+            full_trades_for_tracked_markets=True,
+            trade_page_limit=500,
+            trade_max_offset=10000,
+            trade_frontier={},
+            collect_midpoints=False,
+            collect_spreads=False,
+        )
+
+        calls = dict(collector.calls)
+        self.assertEqual(calls["fetch_trades_incremental"], ["cond-a", "cond-b"])
+        self.assertEqual(calls["fetch_open_interest"], ["cond-a", "cond-b"])
+        self.assertEqual(calls["fetch_holders"], ["cond-a", "cond-b"])
+        self.assertEqual(calls["fetch_books"], ["tok-a-1", "tok-a-2", "tok-b-1", "tok-b-2"])
+        self.assertEqual(calls["stream_market"], ["tok-a-1", "tok-a-2", "tok-b-1", "tok-b-2"])
+
+    def test_collect_cycle_bootstrap_history_uses_all_assets_when_limit_zero(self) -> None:
+        class DummyCollector:
+            def __init__(self) -> None:
+                self.history_calls: list[list[str]] = []
+
+            @staticmethod
+            def extract_condition_ids(markets: list[dict[str, object]]) -> list[str]:
+                return [str(m["conditionId"]) for m in markets]
+
+            @staticmethod
+            def extract_asset_ids(markets: list[dict[str, object]]) -> list[str]:
+                values: list[str] = []
+                for market in markets:
+                    values.extend(list(market["clobTokenIds"]))
+                return values
+
+            def fetch_trades_incremental(self, **kwargs):
+                return [], None, {}, False
+
+            def fetch_open_interest(self, **kwargs):
+                return None
+
+            def fetch_holders(self, **kwargs):
+                return None
+
+            def fetch_books(self, **kwargs):
+                return None
+
+            def fetch_batch_prices_history(self, **kwargs):
+                self.history_calls.append(list(kwargs["token_ids"]))
+                return {}, None
+
+            def stream_market(self, **kwargs):
+                return 0
+
+        collector = DummyCollector()
+        markets = [{"conditionId": "cond-a", "clobTokenIds": ["tok-a-1", "tok-a-2"]}]
+        _collect_cycle(
+            collector=collector,
+            markets=markets,
+            previous_state=UniverseState(condition_ids=set(), asset_ids=set()),
+            max_markets_for_trades=0,
+            max_markets_for_oi_holders=0,
+            max_assets_for_books=0,
+            hot_assets_for_books=0,
+            hot_snapshot_interval_seconds=300,
+            cold_snapshot_interval_seconds=300,
+            max_assets_for_history=0,
+            history_snapshot_interval_seconds=0,
+            history_window_seconds=900,
+            history_interval="all",
+            history_fidelity=1,
+            max_assets_for_ws=0,
+            ws_duration_seconds=5,
+            new_market_backfill_seconds=600,
+            snapshot_state=SnapshotScheduleState(),
+            tracked_selection=TrackedMarketSelection(
+                condition_ids=["cond-a"],
+                asset_ids=["tok-a-1", "tok-a-2"],
+                added_condition_ids=["cond-a"],
+                added_asset_ids=["tok-a-1", "tok-a-2"],
+            ),
+            freeze_tracked_markets=True,
+            full_trades_for_tracked_markets=True,
+            trade_page_limit=500,
+            trade_max_offset=10000,
+            trade_frontier={},
+            collect_midpoints=False,
+            collect_spreads=False,
+        )
+
+        self.assertEqual(collector.history_calls, [["tok-a-1", "tok-a-2"]])
+
 
 if __name__ == "__main__":
     unittest.main()

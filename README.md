@@ -94,29 +94,31 @@ python -m polymarket_collector run-primary \
   --ws-duration-seconds 20
 ```
 
-全量分页扫描 + 富采集：
+长期全量跟踪（推荐）：
 
 ```bash
 python -m polymarket_collector run-primary \
   --node-id local-primary \
-  --interval-seconds 300 \
+  --interval-seconds 60 \
   --discover-all-pages \
   --freeze-tracked-markets \
   --full-trades-for-tracked-markets \
   --page-limit 500 \
-  --max-markets-for-trades 500 \
+  --max-markets-for-trades 0 \
   --trade-page-limit 500 \
   --trade-max-offset 10000 \
-  --max-markets-for-oi-holders 1000 \
-  --max-assets-for-books 2000 \
-  --hot-assets-for-books 300 \
-  --hot-snapshot-interval-seconds 30 \
+  --max-markets-for-oi-holders 0 \
+  --max-assets-for-books 0 \
+  --hot-assets-for-books 0 \
+  --hot-snapshot-interval-seconds 300 \
   --cold-snapshot-interval-seconds 300 \
-  --max-assets-for-history 1000 \
-  --history-snapshot-interval-seconds 1800 \
-  --history-window-seconds 3600 \
+  --max-assets-for-history 0 \
+  --history-snapshot-interval-seconds 0 \
+  --history-window-seconds 900 \
   --history-interval all \
-  --new-market-backfill-seconds 1800
+  --max-assets-for-ws 0 \
+  --ws-duration-seconds 55 \
+  --new-market-backfill-seconds 0
 ```
 
 备节点模式：
@@ -156,20 +158,20 @@ PM_DATA_ROOT=data_run4 PM_DURATION_SECONDS=21600 PM_LOG_FILE=run_primary_run4.lo
 - `PM_INTERVAL_SECONDS=60`
 - `PM_DURATION_SECONDS=43200`（12 小时）
 - `PM_PAGE_LIMIT=500`
-- `PM_MAX_MARKETS_FOR_TRADES=500`
+- `PM_MAX_MARKETS_FOR_TRADES=0`（`<=0` 表示全量）
 - `PM_TRADE_PAGE_LIMIT=500`
 - `PM_TRADE_MAX_OFFSET=10000`
-- `PM_MAX_MARKETS_FOR_OI_HOLDERS=1000`
-- `PM_MAX_ASSETS_FOR_BOOKS=5000`
+- `PM_MAX_MARKETS_FOR_OI_HOLDERS=0`（`<=0` 表示全量）
+- `PM_MAX_ASSETS_FOR_BOOKS=0`（`<=0` 表示全量）
 - `PM_HOT_ASSETS_FOR_BOOKS=0`
 - `PM_HOT_SNAPSHOT_INTERVAL_SECONDS=300`
 - `PM_COLD_SNAPSHOT_INTERVAL_SECONDS=300`
-- `PM_MAX_ASSETS_FOR_HISTORY=0`
+- `PM_MAX_ASSETS_FOR_HISTORY=0`（`<=0` 表示全量）
 - `PM_HISTORY_SNAPSHOT_INTERVAL_SECONDS=0`
 - `PM_HISTORY_WINDOW_SECONDS=900`
 - `PM_HISTORY_INTERVAL=all`
 - `PM_HISTORY_FIDELITY=1`
-- `PM_MAX_ASSETS_FOR_WS=800`
+- `PM_MAX_ASSETS_FOR_WS=0`（`<=0` 表示全量）
 - `PM_WS_DURATION_SECONDS=55`
 - `PM_NEW_MARKET_BACKFILL_SECONDS=0`
 - `PM_FREEZE_TRACKED_MARKETS=1`
@@ -265,7 +267,10 @@ ws_market
 - 默认配置现在以 `ws_market` 为主实时流，`clob_books` 作为低频基准快照；`clob_midpoints`、`clob_spreads`、`clob_batch_prices_history` 默认关闭。
 - `ws_market` 连接内会在收到 `new_market` 时立即追加订阅新市场资产，在收到 `market_resolved` 时立即取消该市场资产订阅；状态会回写到 `tracked_market_selection.json`。
 - 盘口采样仍然使用冷热参数，但默认 `hot_assets_for_books=0`，因此所有 book 快照都按低频基准节奏执行。
-- 只有当 `max_assets_for_history > 0` 且 `history_snapshot_interval_seconds > 0` 或 `new_market_backfill_seconds > 0` 时，才会写 `clob_batch_prices_history`。
+- 对 `max_*` / `max_assets_*` / `max_markets_*` 类参数，`<=0` 统一表示“不限制（全量）”。
+- `clob_batch_prices_history` 触发条件：
+- 周期快照：`history_snapshot_interval_seconds > 0` 时启用（`max_assets_for_history<=0` 表示对全部 tracked 资产）。
+- 新市场回补：`new_market_backfill_seconds > 0` 时启用（回补资产集合同样受 `max_assets_for_history`，`<=0` 为全量）。
 - `--freeze-tracked-markets` 会把跟踪集合持久化到 `tracked_market_selection.json`：保留仍然 active 的旧市场顺序，自动追加新 active 市场，自动移除 inactive/closed 市场。
 - `--full-trades-for-tracked-markets` 会对固定市场集合做分页增量同步，并把已追到的交易前沿写进 `trade_frontier.json`，用于重启后续抓。
 - `clob_batch_prices_history` 对时间参数有约束：当请求带 `start_ts/end_ts` 时，采集器会规范化 `interval` 为 `all`，并在必要时重试不带 `interval` 的请求。
