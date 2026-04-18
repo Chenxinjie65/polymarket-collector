@@ -3,6 +3,7 @@ from __future__ import annotations
 import gzip
 import json
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -593,12 +594,15 @@ class PolymarketCollector:
         custom_feature_enabled: bool = True,
         flush_every_messages: int = 50,
         flush_every_seconds: int = 5,
+        on_new_market: Callable[[dict[str, Any]], None] | None = None,
+        on_market_resolved: Callable[[dict[str, Any]], None] | None = None,
     ) -> int:
         if websocket is None:
             raise RuntimeError(
                 "websocket-client is not installed. Install dependencies from requirements.txt first."
             )
 
+        subscribed_asset_ids = set(asset_ids)
         ws = websocket.create_connection(MARKET_WSS, timeout=self.config.timeout_seconds)
         try:
             ws.settimeout(min(self.config.timeout_seconds, 5))
@@ -629,6 +633,40 @@ class PolymarketCollector:
                     message_count += 1
                     wrapped = self._wrap_ws_message("ws_market", raw_message)
                     pending_records.append(wrapped)
+                    payload = wrapped["payload"]
+                    for event in _iter_ws_market_events(payload):
+                        event_type = event.get("event_type")
+                        if event_type == "new_market":
+                            new_assets = _extract_ws_assets_ids(event)
+                            new_subscriptions = [asset_id for asset_id in new_assets if asset_id not in subscribed_asset_ids]
+                            if new_subscriptions:
+                                ws.send(
+                                    json.dumps(
+                                        {
+                                            "assets_ids": new_subscriptions,
+                                            "operation": "subscribe",
+                                            "custom_feature_enabled": custom_feature_enabled,
+                                        }
+                                    )
+                                )
+                                subscribed_asset_ids.update(new_subscriptions)
+                            if on_new_market is not None:
+                                on_new_market(event)
+                        elif event_type == "market_resolved":
+                            resolved_assets = _extract_ws_assets_ids(event)
+                            unsubscribe_assets = [asset_id for asset_id in resolved_assets if asset_id in subscribed_asset_ids]
+                            if unsubscribe_assets:
+                                ws.send(
+                                    json.dumps(
+                                        {
+                                            "assets_ids": unsubscribe_assets,
+                                            "operation": "unsubscribe",
+                                        }
+                                    )
+                                )
+                                subscribed_asset_ids.difference_update(unsubscribe_assets)
+                            if on_market_resolved is not None:
+                                on_market_resolved(event)
 
                 should_flush = (
                     len(pending_records) >= flush_every_messages
@@ -698,6 +736,36 @@ def _normalize_token_ids(value: Any) -> list[str]:
             return [text]
         if isinstance(parsed, list):
             return [str(item) for item in parsed if item]
+    return []
+
+
+def _iter_ws_market_events(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, dict):
+        return [payload]
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    return []
+
+
+def _extract_ws_assets_ids(event: dict[str, Any]) -> list[str]:
+    direct = event.get("assets_ids")
+    if isinstance(direct, list):
+        return [str(item) for item in direct if item]
+
+    asset_id = event.get("asset_id")
+    if isinstance(asset_id, str) and asset_id:
+        return [asset_id]
+
+    changes = event.get("price_changes")
+    if isinstance(changes, list):
+        values = []
+        for item in changes:
+            if not isinstance(item, dict):
+                continue
+            change_asset_id = item.get("asset_id")
+            if isinstance(change_asset_id, str) and change_asset_id:
+                values.append(change_asset_id)
+        return list(dict.fromkeys(values))
     return []
 
 

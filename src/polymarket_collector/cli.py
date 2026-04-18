@@ -250,6 +250,8 @@ def main() -> int:
             full_trades_for_tracked_markets=args.full_trades_for_tracked_markets,
             trade_page_limit=args.trade_page_limit,
             trade_max_offset=args.trade_max_offset,
+            collect_midpoints=args.collect_midpoints,
+            collect_spreads=args.collect_spreads,
         )
         print("run_primary_completed=true")
         return 0
@@ -284,6 +286,8 @@ def main() -> int:
             full_trades_for_tracked_markets=args.full_trades_for_tracked_markets,
             trade_page_limit=args.trade_page_limit,
             trade_max_offset=args.trade_max_offset,
+            collect_midpoints=args.collect_midpoints,
+            collect_spreads=args.collect_spreads,
         )
         print("run_backup_completed=true")
         return 0
@@ -492,13 +496,13 @@ def build_parser() -> argparse.ArgumentParser:
     primary.add_argument(
         "--max-assets-for-history",
         type=int,
-        default=300,
+        default=0,
         help="Max assets used for periodic price-history snapshots",
     )
     primary.add_argument(
         "--history-snapshot-interval-seconds",
         type=int,
-        default=1800,
+        default=0,
         help="Snapshot interval for batch price history; set 0 to disable",
     )
     primary.add_argument(
@@ -529,7 +533,7 @@ def build_parser() -> argparse.ArgumentParser:
     primary.add_argument(
         "--new-market-backfill-seconds",
         type=int,
-        default=1800,
+        default=0,
         help="History window used to bootstrap newly discovered tokens",
     )
     primary.add_argument(
@@ -553,6 +557,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=10000,
         help="Maximum offset walked during one incremental trade sync",
+    )
+    primary.add_argument(
+        "--collect-midpoints",
+        action="store_true",
+        help="Collect midpoint snapshots together with book snapshots",
+    )
+    primary.add_argument(
+        "--collect-spreads",
+        action="store_true",
+        help="Collect spread snapshots together with book snapshots",
     )
 
     backup = subparsers.add_parser("run-backup", help="Run backup failover loop")
@@ -596,13 +610,13 @@ def build_parser() -> argparse.ArgumentParser:
     backup.add_argument(
         "--max-assets-for-history",
         type=int,
-        default=300,
+        default=0,
         help="Max assets used for periodic price-history snapshots when backup is active",
     )
     backup.add_argument(
         "--history-snapshot-interval-seconds",
         type=int,
-        default=1800,
+        default=0,
         help="Snapshot interval for batch price history when backup is active; set 0 to disable",
     )
     backup.add_argument(
@@ -633,7 +647,7 @@ def build_parser() -> argparse.ArgumentParser:
     backup.add_argument(
         "--new-market-backfill-seconds",
         type=int,
-        default=1800,
+        default=0,
         help="History window used to bootstrap newly discovered tokens",
     )
     backup.add_argument(
@@ -657,6 +671,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=10000,
         help="Maximum offset walked during one incremental trade sync",
+    )
+    backup.add_argument(
+        "--collect-midpoints",
+        action="store_true",
+        help="Collect midpoint snapshots together with book snapshots",
+    )
+    backup.add_argument(
+        "--collect-spreads",
+        action="store_true",
+        help="Collect spread snapshots together with book snapshots",
     )
 
     return parser

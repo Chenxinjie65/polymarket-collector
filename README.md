@@ -161,19 +161,21 @@ PM_DATA_ROOT=data_run4 PM_DURATION_SECONDS=21600 PM_LOG_FILE=run_primary_run4.lo
 - `PM_TRADE_MAX_OFFSET=10000`
 - `PM_MAX_MARKETS_FOR_OI_HOLDERS=1000`
 - `PM_MAX_ASSETS_FOR_BOOKS=5000`
-- `PM_HOT_ASSETS_FOR_BOOKS=1500`
-- `PM_HOT_SNAPSHOT_INTERVAL_SECONDS=20`
-- `PM_COLD_SNAPSHOT_INTERVAL_SECONDS=120`
-- `PM_MAX_ASSETS_FOR_HISTORY=1500`
-- `PM_HISTORY_SNAPSHOT_INTERVAL_SECONDS=900`
+- `PM_HOT_ASSETS_FOR_BOOKS=0`
+- `PM_HOT_SNAPSHOT_INTERVAL_SECONDS=300`
+- `PM_COLD_SNAPSHOT_INTERVAL_SECONDS=300`
+- `PM_MAX_ASSETS_FOR_HISTORY=0`
+- `PM_HISTORY_SNAPSHOT_INTERVAL_SECONDS=0`
 - `PM_HISTORY_WINDOW_SECONDS=900`
 - `PM_HISTORY_INTERVAL=all`
 - `PM_HISTORY_FIDELITY=1`
 - `PM_MAX_ASSETS_FOR_WS=800`
 - `PM_WS_DURATION_SECONDS=55`
-- `PM_NEW_MARKET_BACKFILL_SECONDS=3600`
+- `PM_NEW_MARKET_BACKFILL_SECONDS=0`
 - `PM_FREEZE_TRACKED_MARKETS=1`
 - `PM_FULL_TRADES_FOR_TRACKED_MARKETS=1`
+- `PM_COLLECT_MIDPOINTS=0`
+- `PM_COLLECT_SPREADS=0`
 - `PM_LOG_FILE=run_primary_12h_rich.log`
 - `PM_PID_FILE=.primary.pid`
 - `PM_KILL_EXISTING=1`
@@ -206,22 +208,21 @@ grep -E "ERROR|Traceback|failed:" run_primary_12h_rich.log | tail -n 20
 heartbeat：
 
 ```bash
-cat data_run3/state/heartbeat_cloud-test.json
+cat data/state/heartbeat_cloud-test.json
 ```
 
 建议重点关注字段：
 
 - `status` 应为 `ok`
 - `collection_warnings`、`bootstrap_warnings` 应为空
-- `history_snapshot_asset_count` 应持续大于 0
+- `history_snapshot_asset_count` 在默认配置下应为 `0`
 - `books_hot_snapshot_count`、`books_cold_snapshot_count` 与配置规模一致
 
 数据写入：
 
 ```bash
-find data_run3/raw -maxdepth 1 -mindepth 1 -type d | sort
-find data_run3/raw/source=clob_batch_prices_history -type f | tail
-du -sb data_run3/raw
+find data/raw -maxdepth 1 -mindepth 1 -type d | sort
+du -sb data/raw
 ```
 
 `du -sb` 会持续增长；`du -sh` 可能因单位取整短时间不变化，属于正常现象。
@@ -255,16 +256,16 @@ data_trades
 data_oi
 data_holders
 clob_books
-clob_midpoints
-clob_spreads
-clob_batch_prices_history
 ws_market
 ```
 
 ## 重要实现约束
 
 - `--clob-driver pyclob` 只影响 CLOB 相关调用；缺依赖会快速失败。
-- 盘口采样采用冷热分层频率，降低全量抓取压力。
+- 默认配置现在以 `ws_market` 为主实时流，`clob_books` 作为低频基准快照；`clob_midpoints`、`clob_spreads`、`clob_batch_prices_history` 默认关闭。
+- `ws_market` 连接内会在收到 `new_market` 时立即追加订阅新市场资产，在收到 `market_resolved` 时立即取消该市场资产订阅；状态会回写到 `tracked_market_selection.json`。
+- 盘口采样仍然使用冷热参数，但默认 `hot_assets_for_books=0`，因此所有 book 快照都按低频基准节奏执行。
+- 只有当 `max_assets_for_history > 0` 且 `history_snapshot_interval_seconds > 0` 或 `new_market_backfill_seconds > 0` 时，才会写 `clob_batch_prices_history`。
 - `--freeze-tracked-markets` 会把跟踪集合持久化到 `tracked_market_selection.json`：保留仍然 active 的旧市场顺序，自动追加新 active 市场，自动移除 inactive/closed 市场。
 - `--full-trades-for-tracked-markets` 会对固定市场集合做分页增量同步，并把已追到的交易前沿写进 `trade_frontier.json`，用于重启后续抓。
 - `clob_batch_prices_history` 对时间参数有约束：当请求带 `start_ts/end_ts` 时，采集器会规范化 `interval` 为 `all`，并在必要时重试不带 `interval` 的请求。

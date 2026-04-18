@@ -62,6 +62,8 @@ def run_primary_loop(
     full_trades_for_tracked_markets: bool,
     trade_page_limit: int,
     trade_max_offset: int,
+    collect_midpoints: bool,
+    collect_spreads: bool,
 ) -> None:
     universe_state = _load_universe_state(data_root)
     snapshot_state = SnapshotScheduleState()
@@ -114,10 +116,13 @@ def run_primary_loop(
                 trade_page_limit=trade_page_limit,
                 trade_max_offset=trade_max_offset,
                 trade_frontier=trade_frontier,
+                collect_midpoints=collect_midpoints,
+                collect_spreads=collect_spreads,
             )
             universe_state = cycle_state["current_state"]
             trade_frontier = cycle_state["trade_frontier"]
             _save_universe_state(data_root, universe_state)
+            _save_tracked_market_selection(data_root, cycle_state["tracked_selection"])
             _save_trade_frontier_state(data_root, trade_frontier)
 
             write_heartbeat(
@@ -202,6 +207,8 @@ def run_backup_loop(
     full_trades_for_tracked_markets: bool,
     trade_page_limit: int,
     trade_max_offset: int,
+    collect_midpoints: bool,
+    collect_spreads: bool,
 ) -> None:
     universe_state = _load_universe_state(data_root)
     snapshot_state = SnapshotScheduleState()
@@ -260,10 +267,13 @@ def run_backup_loop(
                     trade_page_limit=trade_page_limit,
                     trade_max_offset=trade_max_offset,
                     trade_frontier=trade_frontier,
+                    collect_midpoints=collect_midpoints,
+                    collect_spreads=collect_spreads,
                 )
                 universe_state = cycle_state["current_state"]
                 trade_frontier = cycle_state["trade_frontier"]
                 _save_universe_state(data_root, universe_state)
+                _save_tracked_market_selection(data_root, cycle_state["tracked_selection"])
                 _save_trade_frontier_state(data_root, trade_frontier)
 
                 write_heartbeat(
@@ -403,6 +413,8 @@ def _collect_cycle(
     trade_page_limit: int,
     trade_max_offset: int,
     trade_frontier: dict[str, Any],
+    collect_midpoints: bool,
+    collect_spreads: bool,
 ) -> dict[str, Any]:
     condition_ids = collector.extract_condition_ids(markets)
     asset_ids = collector.extract_asset_ids(markets)
@@ -448,6 +460,8 @@ def _collect_cycle(
             hot_snapshot_interval_seconds=hot_snapshot_interval_seconds,
             cold_snapshot_interval_seconds=cold_snapshot_interval_seconds,
             snapshot_state=snapshot_state,
+            collect_midpoints=collect_midpoints,
+            collect_spreads=collect_spreads,
         )
     except Exception as exc:  # noqa: BLE001
         books_hot_snapshot_count = 0
@@ -487,6 +501,16 @@ def _collect_cycle(
             collector.stream_market(
                 asset_ids=tracked_asset_ids[:max_assets_for_ws],
                 duration_seconds=ws_duration_seconds,
+                on_new_market=lambda event: _update_tracked_selection_from_ws_event(
+                    selection=tracked_selection,
+                    event=event,
+                    add=True,
+                ),
+                on_market_resolved=lambda event: _update_tracked_selection_from_ws_event(
+                    selection=tracked_selection,
+                    event=event,
+                    add=False,
+                ),
             )
         except Exception as exc:  # noqa: BLE001
             collection_warnings.append(f"stream_market_failed:{exc}")
@@ -521,23 +545,26 @@ def _collect_cycle(
         bootstrap_assets = bootstrap_asset_ids[:max_assets_for_books]
         try:
             collector.fetch_books(token_ids=bootstrap_assets)
-            collector.fetch_midpoints(token_ids=bootstrap_assets)
-            collector.fetch_spreads(token_ids=bootstrap_assets)
+            if collect_midpoints:
+                collector.fetch_midpoints(token_ids=bootstrap_assets)
+            if collect_spreads:
+                collector.fetch_spreads(token_ids=bootstrap_assets)
         except Exception as exc:  # noqa: BLE001
             bootstrap_warnings.append(f"bootstrap_books_failed:{exc}")
 
-        now_ts = int(datetime.now(UTC).timestamp())
-        start_ts = now_ts - max(new_market_backfill_seconds, 60)
-        try:
-            collector.fetch_batch_prices_history(
-                token_ids=bootstrap_assets,
-                start_ts=start_ts,
-                end_ts=now_ts,
-                interval="1m",
-                fidelity=1,
-            )
-        except Exception as exc:  # noqa: BLE001
-            bootstrap_warnings.append(f"batch_prices_history_failed:{exc}")
+        if max_assets_for_history > 0 and new_market_backfill_seconds > 0:
+            now_ts = int(datetime.now(UTC).timestamp())
+            start_ts = now_ts - max(new_market_backfill_seconds, 60)
+            try:
+                collector.fetch_batch_prices_history(
+                    token_ids=bootstrap_assets[:max_assets_for_history],
+                    start_ts=start_ts,
+                    end_ts=now_ts,
+                    interval="1m",
+                    fidelity=1,
+                )
+            except Exception as exc:  # noqa: BLE001
+                bootstrap_warnings.append(f"batch_prices_history_failed:{exc}")
 
     return {
         "current_state": current_state,
@@ -547,8 +574,8 @@ def _collect_cycle(
         "books_hot_snapshot_count": books_hot_snapshot_count,
         "books_cold_snapshot_count": books_cold_snapshot_count,
         "history_snapshot_asset_count": history_snapshot_asset_count,
-        "tracked_condition_ids_count": len(tracked_condition_ids),
-        "tracked_asset_ids_count": len(tracked_asset_ids),
+        "tracked_condition_ids_count": len(tracked_selection.condition_ids),
+        "tracked_asset_ids_count": len(tracked_selection.asset_ids),
         "tracked_added_condition_ids_count": len(tracked_selection.added_condition_ids),
         "tracked_removed_condition_ids_count": len(tracked_selection.removed_condition_ids),
         "tracked_added_asset_ids_count": len(tracked_selection.added_asset_ids),
@@ -556,6 +583,7 @@ def _collect_cycle(
         "collection_warnings": collection_warnings,
         "bootstrap_warnings": bootstrap_warnings,
         "trade_frontier": trade_frontier,
+        "tracked_selection": tracked_selection,
     }
 
 
@@ -568,6 +596,8 @@ def _collect_tiered_book_snapshots(
     hot_snapshot_interval_seconds: int,
     cold_snapshot_interval_seconds: int,
     snapshot_state: SnapshotScheduleState,
+    collect_midpoints: bool,
+    collect_spreads: bool,
 ) -> tuple[int, int]:
     assets = asset_ids[:max_assets_for_books]
     if not assets:
@@ -589,14 +619,18 @@ def _collect_tiered_book_snapshots(
 
     if hot_due:
         collector.fetch_books(token_ids=hot_assets)
-        collector.fetch_midpoints(token_ids=hot_assets)
-        collector.fetch_spreads(token_ids=hot_assets)
+        if collect_midpoints:
+            collector.fetch_midpoints(token_ids=hot_assets)
+        if collect_spreads:
+            collector.fetch_spreads(token_ids=hot_assets)
         snapshot_state.last_hot_snapshot_at = now
 
     if cold_due:
         collector.fetch_books(token_ids=cold_assets)
-        collector.fetch_midpoints(token_ids=cold_assets)
-        collector.fetch_spreads(token_ids=cold_assets)
+        if collect_midpoints:
+            collector.fetch_midpoints(token_ids=cold_assets)
+        if collect_spreads:
+            collector.fetch_spreads(token_ids=cold_assets)
         snapshot_state.last_cold_snapshot_at = now
 
     return len(hot_assets) if hot_due else 0, len(cold_assets) if cold_due else 0
@@ -727,6 +761,74 @@ def _merge_persistent_ids(*, existing_ids: list[str], active_ids: list[str]) -> 
     removed = [item for item in existing_ids if item not in active_set]
     added = [item for item in active_ids if item not in existing_set]
     return kept + added, added, removed
+
+
+def _update_tracked_selection_from_ws_event(
+    *,
+    selection: TrackedMarketSelection,
+    event: dict[str, Any],
+    add: bool,
+) -> None:
+    condition_id = _extract_ws_condition_id(event)
+    asset_ids = _extract_ws_asset_ids(event)
+    if add:
+        _append_tracked_ids(selection.condition_ids, [condition_id] if condition_id else [])
+        _append_tracked_ids(selection.asset_ids, asset_ids)
+        _append_tracked_ids(selection.added_condition_ids, [condition_id] if condition_id else [])
+        _append_tracked_ids(selection.added_asset_ids, asset_ids)
+        if condition_id:
+            _remove_tracked_ids(selection.removed_condition_ids, [condition_id])
+        _remove_tracked_ids(selection.removed_asset_ids, asset_ids)
+        return
+
+    _remove_tracked_ids(selection.condition_ids, [condition_id] if condition_id else [])
+    _remove_tracked_ids(selection.asset_ids, asset_ids)
+    _append_tracked_ids(selection.removed_condition_ids, [condition_id] if condition_id else [])
+    _append_tracked_ids(selection.removed_asset_ids, asset_ids)
+    if condition_id:
+        _remove_tracked_ids(selection.added_condition_ids, [condition_id])
+    _remove_tracked_ids(selection.added_asset_ids, asset_ids)
+
+
+def _extract_ws_condition_id(event: dict[str, Any]) -> str | None:
+    for key in ("condition_id", "market"):
+        value = event.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _extract_ws_asset_ids(event: dict[str, Any]) -> list[str]:
+    values = event.get("assets_ids")
+    if isinstance(values, list):
+        return [str(item) for item in values if item]
+
+    token_ids = event.get("clob_token_ids")
+    if isinstance(token_ids, list):
+        return [str(item) for item in token_ids if item]
+
+    asset_id = event.get("asset_id")
+    if isinstance(asset_id, str) and asset_id:
+        return [asset_id]
+    return []
+
+
+def _append_tracked_ids(target: list[str], values: list[str]) -> None:
+    seen = set(target)
+    for value in values:
+        if not value or value in seen:
+            continue
+        target.append(value)
+        seen.add(value)
+
+
+def _remove_tracked_ids(target: list[str], values: list[str]) -> None:
+    if not values:
+        return
+    to_remove = set(value for value in values if value)
+    if not to_remove:
+        return
+    target[:] = [item for item in target if item not in to_remove]
 
 
 def _save_tracked_market_selection(data_root: Path, selection: TrackedMarketSelection) -> Path:
