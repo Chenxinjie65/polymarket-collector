@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -37,7 +38,8 @@ CLOB_API = "https://clob.polymarket.com"
 MARKET_WSS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 MAX_TRADE_MARKET_QUERY_CHARS = 3000
 MAX_TRADE_PAGE_LIMIT = 500
-MAX_TRADE_PAGE_OFFSET = 10000
+# The public trades API becomes unreliable at higher offsets; keep a safer default.
+MAX_TRADE_PAGE_OFFSET = 3000
 MAX_DATA_MARKETS_BATCH_SIZE = 100
 MAX_CLOB_BOOKS_BATCH_SIZE = 100
 MAX_CLOB_MIDPOINTS_BATCH_SIZE = 200
@@ -57,6 +59,8 @@ class CollectorConfig:
 
 
 class JsonlGzWriter:
+    _global_write_lock = threading.Lock()
+
     def __init__(self, root: Path, *, bucket_seconds: int, node_id: str) -> None:
         self.root = root
         self.bucket_seconds = max(1, int(bucket_seconds))
@@ -77,10 +81,11 @@ class JsonlGzWriter:
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / f"bucket_start={bucket_start:%Y%m%dT%H%M%SZ}_node={self.node_id}.jsonl.gz"
 
-        with gzip.open(path, "at", encoding="utf-8") as handle:
-            for record in records:
-                handle.write(json.dumps(record, ensure_ascii=True, separators=(",", ":")))
-                handle.write("\n")
+        with self._global_write_lock:
+            with gzip.open(path, "at", encoding="utf-8") as handle:
+                for record in records:
+                    handle.write(json.dumps(record, ensure_ascii=True, separators=(",", ":")))
+                    handle.write("\n")
 
         return path
 

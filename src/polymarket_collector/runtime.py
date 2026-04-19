@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import concurrent.futures
 import json
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from polymarket_collector.collector import PolymarketCollector
+from polymarket_collector.collector import CollectorConfig, PolymarketCollector
 from polymarket_collector.state_ops import evaluate_failover, write_heartbeat
 
 
@@ -34,6 +36,116 @@ class TrackedMarketSelection:
     removed_asset_ids: list[str] = field(default_factory=list)
 
 
+class _BackgroundWsCollector:
+    def __init__(
+        self,
+        *,
+        collector_config: CollectorConfig,
+        data_root: Path,
+        worker_count: int,
+        max_assets_for_ws: int,
+        ws_duration_seconds: int,
+        flush_every_messages: int,
+        flush_every_seconds: int,
+        subscribe_batch_size: int,
+    ) -> None:
+        self.collector_config = collector_config
+        self.data_root = data_root
+        self.worker_count = max(1, worker_count)
+        self.max_assets_for_ws = max_assets_for_ws
+        self.ws_duration_seconds = max(1, ws_duration_seconds)
+        self.flush_every_messages = max(1, flush_every_messages)
+        self.flush_every_seconds = max(1, flush_every_seconds)
+        self.subscribe_batch_size = max(1, subscribe_batch_size)
+        self._selection: TrackedMarketSelection | None = None
+        self._selection_lock = threading.Lock()
+        self._worker_errors: list[str | None] = [None for _ in range(self.worker_count)]
+        self._error_lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._threads = [
+            threading.Thread(
+                target=self._run_worker,
+                args=(worker_index,),
+                name=f"polymarket-ws-{worker_index}",
+                daemon=True,
+            )
+            for worker_index in range(self.worker_count)
+        ]
+
+    def start(self) -> None:
+        for thread in self._threads:
+            thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        for thread in self._threads:
+            thread.join(timeout=self.ws_duration_seconds + 5)
+
+    def update_selection(self, selection: TrackedMarketSelection) -> None:
+        with self._selection_lock:
+            self._selection = _clone_tracked_market_selection(selection)
+
+    def snapshot_selection(self) -> TrackedMarketSelection | None:
+        with self._selection_lock:
+            if self._selection is None:
+                return None
+            return _clone_tracked_market_selection(self._selection)
+
+    def last_error(self) -> str | None:
+        with self._error_lock:
+            errors = [error for error in self._worker_errors if error]
+        return ";".join(errors) if errors else None
+
+    def _set_worker_error(self, worker_index: int, value: str | None) -> None:
+        with self._error_lock:
+            self._worker_errors[worker_index] = value
+
+    def _run_worker(self, worker_index: int) -> None:
+        collector = PolymarketCollector(self.collector_config)
+        while not self._stop_event.is_set():
+            selection = self.snapshot_selection()
+            if selection is None:
+                self._stop_event.wait(1)
+                continue
+
+            asset_ids = _shard_items(
+                values=_limit_items(selection.asset_ids, self.max_assets_for_ws),
+                shard_count=self.worker_count,
+                shard_index=worker_index,
+            )
+            if not asset_ids:
+                self._stop_event.wait(1)
+                continue
+
+            try:
+                collector.stream_market(
+                    asset_ids=asset_ids,
+                    duration_seconds=self.ws_duration_seconds,
+                    flush_every_messages=self.flush_every_messages,
+                    flush_every_seconds=self.flush_every_seconds,
+                    subscribe_batch_size=self.subscribe_batch_size,
+                    on_new_market=lambda event: self._handle_event(event=event, add=True),
+                    on_market_resolved=lambda event: self._handle_event(event=event, add=False),
+                )
+                self._set_worker_error(worker_index, None)
+            except Exception as exc:  # noqa: BLE001
+                self._set_worker_error(worker_index, f"background_stream_market_failed[{worker_index}]:{exc}")
+                if self._stop_event.wait(5):
+                    return
+
+    def _handle_event(self, *, event: dict[str, Any], add: bool) -> None:
+        with self._selection_lock:
+            if self._selection is None:
+                return
+            _update_tracked_selection_from_ws_event(
+                selection=self._selection,
+                event=event,
+                add=add,
+            )
+            updated_selection = _clone_tracked_market_selection(self._selection)
+        _save_tracked_market_selection(self.data_root, updated_selection)
+
+
 def run_primary_loop(
     *,
     collector: PolymarketCollector,
@@ -55,6 +167,12 @@ def run_primary_loop(
     history_fidelity: int,
     max_assets_for_ws: int,
     ws_duration_seconds: int,
+    ws_worker_count: int,
+    ws_flush_every_messages: int,
+    ws_flush_every_seconds: int,
+    ws_subscribe_batch_size: int,
+    rest_worker_count: int,
+    trade_worker_count: int,
     discover_all_pages: bool,
     page_limit: int,
     new_market_backfill_seconds: int,
@@ -69,160 +187,21 @@ def run_primary_loop(
     snapshot_state = SnapshotScheduleState()
     trade_frontier = _load_trade_frontier_state(data_root)
     start = time.monotonic()
-    while True:
-        cycle_started = time.monotonic()
-        try:
-            markets = _discover_markets_for_cycle(
-                collector=collector,
-                discover_all_pages=discover_all_pages,
-                market_limit=market_limit,
-                page_limit=page_limit,
-            )
-            _write_latest_markets(data_root, markets)
-            tracked_selection = _resolve_tracked_market_selection(
-                data_root=data_root,
-                markets=markets,
-                freeze_tracked_markets=freeze_tracked_markets,
-            )
-            event_count, event_warnings = _discover_events_for_cycle(
-                collector=collector,
-                data_root=data_root,
-                discover_all_pages=discover_all_pages,
-                market_limit=market_limit,
-                page_limit=page_limit,
-            )
-            cycle_state = _collect_cycle(
-                collector=collector,
-                markets=markets,
-                previous_state=universe_state,
-                max_markets_for_trades=max_markets_for_trades,
-                max_markets_for_oi_holders=max_markets_for_oi_holders,
-                max_assets_for_books=max_assets_for_books,
-                hot_assets_for_books=hot_assets_for_books,
-                hot_snapshot_interval_seconds=hot_snapshot_interval_seconds,
-                cold_snapshot_interval_seconds=cold_snapshot_interval_seconds,
-                max_assets_for_history=max_assets_for_history,
-                history_snapshot_interval_seconds=history_snapshot_interval_seconds,
-                history_window_seconds=history_window_seconds,
-                history_interval=history_interval,
-                history_fidelity=history_fidelity,
-                max_assets_for_ws=max_assets_for_ws,
-                ws_duration_seconds=ws_duration_seconds,
-                new_market_backfill_seconds=new_market_backfill_seconds,
-                snapshot_state=snapshot_state,
-                tracked_selection=tracked_selection,
-                freeze_tracked_markets=freeze_tracked_markets,
-                full_trades_for_tracked_markets=full_trades_for_tracked_markets,
-                trade_page_limit=trade_page_limit,
-                trade_max_offset=trade_max_offset,
-                trade_frontier=trade_frontier,
-                collect_midpoints=collect_midpoints,
-                collect_spreads=collect_spreads,
-            )
-            universe_state = cycle_state["current_state"]
-            trade_frontier = cycle_state["trade_frontier"]
-            _save_universe_state(data_root, universe_state)
-            _save_tracked_market_selection(data_root, cycle_state["tracked_selection"])
-            _save_trade_frontier_state(data_root, trade_frontier)
-
-            write_heartbeat(
-                data_root=data_root,
-                node_id=node_id,
-                role="primary",
-                status="ok",
-                extra={
-                    "mode": "collecting",
-                    "cycle_ts": datetime.now(UTC).isoformat(),
-                    "markets_count": len(markets),
-                    "events_count": event_count,
-                    "condition_ids_count": len(universe_state.condition_ids),
-                    "asset_ids_count": len(universe_state.asset_ids),
-                    "new_condition_ids_count": cycle_state["new_condition_ids_count"],
-                    "new_asset_ids_count": cycle_state["new_asset_ids_count"],
-                    "oi_holders_market_count": cycle_state["oi_holders_market_count"],
-                    "books_hot_snapshot_count": cycle_state["books_hot_snapshot_count"],
-                    "books_cold_snapshot_count": cycle_state["books_cold_snapshot_count"],
-                    "history_snapshot_asset_count": cycle_state["history_snapshot_asset_count"],
-                    "tracked_market_selection_mode": "persistent" if freeze_tracked_markets else "dynamic",
-                    "tracked_condition_ids_count": cycle_state["tracked_condition_ids_count"],
-                    "tracked_asset_ids_count": cycle_state["tracked_asset_ids_count"],
-                    "tracked_added_condition_ids_count": cycle_state["tracked_added_condition_ids_count"],
-                    "tracked_removed_condition_ids_count": cycle_state["tracked_removed_condition_ids_count"],
-                    "tracked_added_asset_ids_count": cycle_state["tracked_added_asset_ids_count"],
-                    "tracked_removed_asset_ids_count": cycle_state["tracked_removed_asset_ids_count"],
-                    "trade_frontier_condition_count": len(trade_frontier),
-                    "collection_warnings": event_warnings + cycle_state["collection_warnings"],
-                    "bootstrap_warnings": cycle_state["bootstrap_warnings"],
-                },
-            )
-        except Exception as exc:  # noqa: BLE001
-            write_heartbeat(
-                data_root=data_root,
-                node_id=node_id,
-                role="primary",
-                status="error",
-                extra={
-                    "mode": "collecting",
-                    "error": str(exc),
-                    "cycle_ts": datetime.now(UTC).isoformat(),
-                },
-            )
-
-        if duration_seconds > 0 and (time.monotonic() - start) >= duration_seconds:
-            return
-
-        elapsed = time.monotonic() - cycle_started
-        sleep_seconds = max(0, interval_seconds - int(elapsed))
-        if sleep_seconds > 0:
-            time.sleep(sleep_seconds)
-
-
-def run_backup_loop(
-    *,
-    collector: PolymarketCollector,
-    data_root: Path,
-    node_id: str,
-    primary_node_id: str,
-    check_interval_seconds: int,
-    max_stale_seconds: int,
-    duration_seconds: int,
-    market_limit: int,
-    max_markets_for_trades: int,
-    max_markets_for_oi_holders: int,
-    max_assets_for_books: int,
-    hot_assets_for_books: int,
-    hot_snapshot_interval_seconds: int,
-    cold_snapshot_interval_seconds: int,
-    max_assets_for_history: int,
-    history_snapshot_interval_seconds: int,
-    history_window_seconds: int,
-    history_interval: str,
-    history_fidelity: int,
-    max_assets_for_ws: int,
-    ws_duration_seconds: int,
-    discover_all_pages: bool,
-    page_limit: int,
-    new_market_backfill_seconds: int,
-    freeze_tracked_markets: bool,
-    full_trades_for_tracked_markets: bool,
-    trade_page_limit: int,
-    trade_max_offset: int,
-    collect_midpoints: bool,
-    collect_spreads: bool,
-) -> None:
-    universe_state = _load_universe_state(data_root)
-    snapshot_state = SnapshotScheduleState()
-    trade_frontier = _load_trade_frontier_state(data_root)
-    start = time.monotonic()
-    while True:
-        cycle_started = time.monotonic()
-        try:
-            decision = evaluate_failover(
-                data_root=data_root,
-                primary_node_id=primary_node_id,
-                max_stale_seconds=max_stale_seconds,
-            )
-            if decision["recommend_backup_collect"]:
+    ws_collector = _BackgroundWsCollector(
+        collector_config=collector.config,
+        data_root=data_root,
+        worker_count=ws_worker_count,
+        max_assets_for_ws=max_assets_for_ws,
+        ws_duration_seconds=ws_duration_seconds,
+        flush_every_messages=ws_flush_every_messages,
+        flush_every_seconds=ws_flush_every_seconds,
+        subscribe_batch_size=ws_subscribe_batch_size,
+    )
+    ws_collector.start()
+    try:
+        while True:
+            cycle_started = time.monotonic()
+            try:
                 markets = _discover_markets_for_cycle(
                     collector=collector,
                     discover_all_pages=discover_all_pages,
@@ -235,6 +214,7 @@ def run_backup_loop(
                     markets=markets,
                     freeze_tracked_markets=freeze_tracked_markets,
                 )
+                ws_collector.update_selection(tracked_selection)
                 event_count, event_warnings = _discover_events_for_cycle(
                     collector=collector,
                     data_root=data_root,
@@ -269,21 +249,30 @@ def run_backup_loop(
                     trade_frontier=trade_frontier,
                     collect_midpoints=collect_midpoints,
                     collect_spreads=collect_spreads,
+                    collect_ws_inline=False,
+                    rest_worker_count=rest_worker_count,
+                    trade_worker_count=trade_worker_count,
+                    on_trade_frontier_update=lambda frontier: _save_trade_frontier_state(data_root, frontier),
                 )
                 universe_state = cycle_state["current_state"]
                 trade_frontier = cycle_state["trade_frontier"]
+                persisted_tracked_selection = ws_collector.snapshot_selection() or cycle_state["tracked_selection"]
+                collection_warnings = event_warnings + cycle_state["collection_warnings"]
+                ws_error = ws_collector.last_error()
+                if ws_error:
+                    collection_warnings.append(ws_error)
+
                 _save_universe_state(data_root, universe_state)
-                _save_tracked_market_selection(data_root, cycle_state["tracked_selection"])
+                _save_tracked_market_selection(data_root, persisted_tracked_selection)
                 _save_trade_frontier_state(data_root, trade_frontier)
 
                 write_heartbeat(
                     data_root=data_root,
                     node_id=node_id,
-                    role="backup",
+                    role="primary",
                     status="ok",
                     extra={
-                        "mode": "active",
-                        "failover_decision": decision,
+                        "mode": "collecting",
                         "cycle_ts": datetime.now(UTC).isoformat(),
                         "markets_count": len(markets),
                         "events_count": event_count,
@@ -296,49 +285,240 @@ def run_backup_loop(
                         "books_cold_snapshot_count": cycle_state["books_cold_snapshot_count"],
                         "history_snapshot_asset_count": cycle_state["history_snapshot_asset_count"],
                         "tracked_market_selection_mode": "persistent" if freeze_tracked_markets else "dynamic",
-                        "tracked_condition_ids_count": cycle_state["tracked_condition_ids_count"],
-                        "tracked_asset_ids_count": cycle_state["tracked_asset_ids_count"],
-                        "tracked_added_condition_ids_count": cycle_state["tracked_added_condition_ids_count"],
-                        "tracked_removed_condition_ids_count": cycle_state["tracked_removed_condition_ids_count"],
-                        "tracked_added_asset_ids_count": cycle_state["tracked_added_asset_ids_count"],
-                        "tracked_removed_asset_ids_count": cycle_state["tracked_removed_asset_ids_count"],
+                        "tracked_condition_ids_count": len(persisted_tracked_selection.condition_ids),
+                        "tracked_asset_ids_count": len(persisted_tracked_selection.asset_ids),
+                        "tracked_added_condition_ids_count": len(persisted_tracked_selection.added_condition_ids),
+                        "tracked_removed_condition_ids_count": len(persisted_tracked_selection.removed_condition_ids),
+                        "tracked_added_asset_ids_count": len(persisted_tracked_selection.added_asset_ids),
+                        "tracked_removed_asset_ids_count": len(persisted_tracked_selection.removed_asset_ids),
                         "trade_frontier_condition_count": len(trade_frontier),
-                        "collection_warnings": event_warnings + cycle_state["collection_warnings"],
+                        "collection_warnings": collection_warnings,
                         "bootstrap_warnings": cycle_state["bootstrap_warnings"],
                     },
                 )
-            else:
+            except Exception as exc:  # noqa: BLE001
+                write_heartbeat(
+                    data_root=data_root,
+                    node_id=node_id,
+                    role="primary",
+                    status="error",
+                    extra={
+                        "mode": "collecting",
+                        "error": str(exc),
+                        "cycle_ts": datetime.now(UTC).isoformat(),
+                    },
+                )
+
+            if duration_seconds > 0 and (time.monotonic() - start) >= duration_seconds:
+                return
+
+            elapsed = time.monotonic() - cycle_started
+            sleep_seconds = max(0, interval_seconds - int(elapsed))
+            if sleep_seconds > 0:
+                time.sleep(sleep_seconds)
+    finally:
+        ws_collector.stop()
+
+
+def run_backup_loop(
+    *,
+    collector: PolymarketCollector,
+    data_root: Path,
+    node_id: str,
+    primary_node_id: str,
+    check_interval_seconds: int,
+    max_stale_seconds: int,
+    duration_seconds: int,
+    market_limit: int,
+    max_markets_for_trades: int,
+    max_markets_for_oi_holders: int,
+    max_assets_for_books: int,
+    hot_assets_for_books: int,
+    hot_snapshot_interval_seconds: int,
+    cold_snapshot_interval_seconds: int,
+    max_assets_for_history: int,
+    history_snapshot_interval_seconds: int,
+    history_window_seconds: int,
+    history_interval: str,
+    history_fidelity: int,
+    max_assets_for_ws: int,
+    ws_duration_seconds: int,
+    ws_worker_count: int,
+    ws_flush_every_messages: int,
+    ws_flush_every_seconds: int,
+    ws_subscribe_batch_size: int,
+    rest_worker_count: int,
+    trade_worker_count: int,
+    discover_all_pages: bool,
+    page_limit: int,
+    new_market_backfill_seconds: int,
+    freeze_tracked_markets: bool,
+    full_trades_for_tracked_markets: bool,
+    trade_page_limit: int,
+    trade_max_offset: int,
+    collect_midpoints: bool,
+    collect_spreads: bool,
+) -> None:
+    universe_state = _load_universe_state(data_root)
+    snapshot_state = SnapshotScheduleState()
+    trade_frontier = _load_trade_frontier_state(data_root)
+    start = time.monotonic()
+    ws_collector: _BackgroundWsCollector | None = None
+    try:
+        while True:
+            cycle_started = time.monotonic()
+            try:
+                decision = evaluate_failover(
+                    data_root=data_root,
+                    primary_node_id=primary_node_id,
+                    max_stale_seconds=max_stale_seconds,
+                )
+                if decision["recommend_backup_collect"]:
+                    if ws_collector is None:
+                        ws_collector = _BackgroundWsCollector(
+                            collector_config=collector.config,
+                            data_root=data_root,
+                            worker_count=ws_worker_count,
+                            max_assets_for_ws=max_assets_for_ws,
+                            ws_duration_seconds=ws_duration_seconds,
+                            flush_every_messages=ws_flush_every_messages,
+                            flush_every_seconds=ws_flush_every_seconds,
+                            subscribe_batch_size=ws_subscribe_batch_size,
+                        )
+                        ws_collector.start()
+                    markets = _discover_markets_for_cycle(
+                        collector=collector,
+                        discover_all_pages=discover_all_pages,
+                        market_limit=market_limit,
+                        page_limit=page_limit,
+                    )
+                    _write_latest_markets(data_root, markets)
+                    tracked_selection = _resolve_tracked_market_selection(
+                        data_root=data_root,
+                        markets=markets,
+                        freeze_tracked_markets=freeze_tracked_markets,
+                    )
+                    ws_collector.update_selection(tracked_selection)
+                    event_count, event_warnings = _discover_events_for_cycle(
+                        collector=collector,
+                        data_root=data_root,
+                        discover_all_pages=discover_all_pages,
+                        market_limit=market_limit,
+                        page_limit=page_limit,
+                    )
+                    cycle_state = _collect_cycle(
+                        collector=collector,
+                        markets=markets,
+                        previous_state=universe_state,
+                        max_markets_for_trades=max_markets_for_trades,
+                        max_markets_for_oi_holders=max_markets_for_oi_holders,
+                        max_assets_for_books=max_assets_for_books,
+                        hot_assets_for_books=hot_assets_for_books,
+                        hot_snapshot_interval_seconds=hot_snapshot_interval_seconds,
+                        cold_snapshot_interval_seconds=cold_snapshot_interval_seconds,
+                        max_assets_for_history=max_assets_for_history,
+                        history_snapshot_interval_seconds=history_snapshot_interval_seconds,
+                        history_window_seconds=history_window_seconds,
+                        history_interval=history_interval,
+                        history_fidelity=history_fidelity,
+                        max_assets_for_ws=max_assets_for_ws,
+                        ws_duration_seconds=ws_duration_seconds,
+                        new_market_backfill_seconds=new_market_backfill_seconds,
+                        snapshot_state=snapshot_state,
+                        tracked_selection=tracked_selection,
+                        freeze_tracked_markets=freeze_tracked_markets,
+                        full_trades_for_tracked_markets=full_trades_for_tracked_markets,
+                        trade_page_limit=trade_page_limit,
+                        trade_max_offset=trade_max_offset,
+                        trade_frontier=trade_frontier,
+                        collect_midpoints=collect_midpoints,
+                        collect_spreads=collect_spreads,
+                        collect_ws_inline=False,
+                        rest_worker_count=rest_worker_count,
+                        trade_worker_count=trade_worker_count,
+                        on_trade_frontier_update=lambda frontier: _save_trade_frontier_state(data_root, frontier),
+                    )
+                    universe_state = cycle_state["current_state"]
+                    trade_frontier = cycle_state["trade_frontier"]
+                    persisted_tracked_selection = ws_collector.snapshot_selection() or cycle_state["tracked_selection"]
+                    collection_warnings = event_warnings + cycle_state["collection_warnings"]
+                    ws_error = ws_collector.last_error()
+                    if ws_error:
+                        collection_warnings.append(ws_error)
+
+                    _save_universe_state(data_root, universe_state)
+                    _save_tracked_market_selection(data_root, persisted_tracked_selection)
+                    _save_trade_frontier_state(data_root, trade_frontier)
+
+                    write_heartbeat(
+                        data_root=data_root,
+                        node_id=node_id,
+                        role="backup",
+                        status="ok",
+                        extra={
+                            "mode": "active",
+                            "failover_decision": decision,
+                            "cycle_ts": datetime.now(UTC).isoformat(),
+                            "markets_count": len(markets),
+                            "events_count": event_count,
+                            "condition_ids_count": len(universe_state.condition_ids),
+                            "asset_ids_count": len(universe_state.asset_ids),
+                            "new_condition_ids_count": cycle_state["new_condition_ids_count"],
+                            "new_asset_ids_count": cycle_state["new_asset_ids_count"],
+                            "oi_holders_market_count": cycle_state["oi_holders_market_count"],
+                            "books_hot_snapshot_count": cycle_state["books_hot_snapshot_count"],
+                            "books_cold_snapshot_count": cycle_state["books_cold_snapshot_count"],
+                            "history_snapshot_asset_count": cycle_state["history_snapshot_asset_count"],
+                            "tracked_market_selection_mode": "persistent" if freeze_tracked_markets else "dynamic",
+                            "tracked_condition_ids_count": len(persisted_tracked_selection.condition_ids),
+                            "tracked_asset_ids_count": len(persisted_tracked_selection.asset_ids),
+                            "tracked_added_condition_ids_count": len(persisted_tracked_selection.added_condition_ids),
+                            "tracked_removed_condition_ids_count": len(persisted_tracked_selection.removed_condition_ids),
+                            "tracked_added_asset_ids_count": len(persisted_tracked_selection.added_asset_ids),
+                            "tracked_removed_asset_ids_count": len(persisted_tracked_selection.removed_asset_ids),
+                            "trade_frontier_condition_count": len(trade_frontier),
+                            "collection_warnings": collection_warnings,
+                            "bootstrap_warnings": cycle_state["bootstrap_warnings"],
+                        },
+                    )
+                else:
+                    if ws_collector is not None:
+                        ws_collector.stop()
+                        ws_collector = None
+                    write_heartbeat(
+                        data_root=data_root,
+                        node_id=node_id,
+                        role="backup",
+                        status="ok",
+                        extra={
+                            "mode": "standby",
+                            "failover_decision": decision,
+                            "cycle_ts": datetime.now(UTC).isoformat(),
+                        },
+                    )
+            except Exception as exc:  # noqa: BLE001
                 write_heartbeat(
                     data_root=data_root,
                     node_id=node_id,
                     role="backup",
-                    status="ok",
+                    status="error",
                     extra={
                         "mode": "standby",
-                        "failover_decision": decision,
+                        "error": str(exc),
                         "cycle_ts": datetime.now(UTC).isoformat(),
                     },
                 )
-        except Exception as exc:  # noqa: BLE001
-            write_heartbeat(
-                data_root=data_root,
-                node_id=node_id,
-                role="backup",
-                status="error",
-                extra={
-                    "mode": "standby",
-                    "error": str(exc),
-                    "cycle_ts": datetime.now(UTC).isoformat(),
-                },
-            )
 
-        if duration_seconds > 0 and (time.monotonic() - start) >= duration_seconds:
-            return
+            if duration_seconds > 0 and (time.monotonic() - start) >= duration_seconds:
+                return
 
-        elapsed = time.monotonic() - cycle_started
-        sleep_seconds = max(0, check_interval_seconds - int(elapsed))
-        if sleep_seconds > 0:
-            time.sleep(sleep_seconds)
+            elapsed = time.monotonic() - cycle_started
+            sleep_seconds = max(0, check_interval_seconds - int(elapsed))
+            if sleep_seconds > 0:
+                time.sleep(sleep_seconds)
+    finally:
+        if ws_collector is not None:
+            ws_collector.stop()
 
 
 def _write_latest_markets(data_root: Path, markets: list[dict[str, Any]]) -> Path:
@@ -415,6 +595,10 @@ def _collect_cycle(
     trade_frontier: dict[str, Any],
     collect_midpoints: bool,
     collect_spreads: bool,
+    collect_ws_inline: bool = True,
+    rest_worker_count: int = 4,
+    trade_worker_count: int = 4,
+    on_trade_frontier_update: Any | None = None,
 ) -> dict[str, Any]:
     condition_ids = collector.extract_condition_ids(markets)
     asset_ids = collector.extract_asset_ids(markets)
@@ -427,77 +611,90 @@ def _collect_cycle(
     new_condition_ids = sorted(current_state.condition_ids - previous_state.condition_ids)
     new_asset_ids = sorted(current_state.asset_ids - previous_state.asset_ids)
     collection_warnings: list[str] = []
+    collector_factory = _build_parallel_collector_factory(collector)
 
     # 1) Normal cycle collection for current known universe.
-    try:
-        tracked_trade_condition_ids = _limit_items(tracked_condition_ids, max_markets_for_trades)
-        if tracked_trade_condition_ids:
-            if full_trades_for_tracked_markets:
-                _, _, trade_frontier, hit_trade_offset_cap = collector.fetch_trades_incremental(
-                    condition_ids=tracked_trade_condition_ids,
-                    frontier_by_condition=trade_frontier,
-                    page_limit=trade_page_limit,
-                    max_offset=trade_max_offset,
-                    taker_only=False,
-                )
-                if hit_trade_offset_cap:
-                    collection_warnings.append("fetch_trades_reached_offset_cap")
-            else:
-                collector.fetch_trades(
-                    condition_ids=tracked_trade_condition_ids,
-                    limit=trade_page_limit,
-                    taker_only=False,
-                )
-    except Exception as exc:  # noqa: BLE001
-        collection_warnings.append(f"fetch_trades_failed:{exc}")
-
-    try:
-        books_hot_snapshot_count, books_cold_snapshot_count = _collect_tiered_book_snapshots(
-            collector=collector,
-            asset_ids=tracked_asset_ids,
-            max_assets_for_books=max_assets_for_books,
-            hot_assets_for_books=hot_assets_for_books,
-            hot_snapshot_interval_seconds=hot_snapshot_interval_seconds,
-            cold_snapshot_interval_seconds=cold_snapshot_interval_seconds,
-            snapshot_state=snapshot_state,
-            collect_midpoints=collect_midpoints,
-            collect_spreads=collect_spreads,
-        )
-    except Exception as exc:  # noqa: BLE001
-        books_hot_snapshot_count = 0
-        books_cold_snapshot_count = 0
-        collection_warnings.append(f"book_snapshot_failed:{exc}")
+    tracked_trade_condition_ids = _limit_items(tracked_condition_ids, max_markets_for_trades)
+    trade_frontier, hit_trade_offset_cap, trade_warnings = _collect_trade_batches(
+        collector_factory=collector_factory,
+        condition_ids=tracked_trade_condition_ids,
+        full_trades_for_tracked_markets=full_trades_for_tracked_markets,
+        trade_page_limit=trade_page_limit,
+        trade_max_offset=trade_max_offset,
+        trade_frontier=trade_frontier,
+        trade_worker_count=trade_worker_count,
+        warning_prefix="fetch_trades",
+        on_trade_frontier_update=on_trade_frontier_update,
+    )
+    collection_warnings.extend(trade_warnings)
+    if hit_trade_offset_cap:
+        collection_warnings.append("fetch_trades_reached_offset_cap")
 
     oi_condition_ids = _limit_items(tracked_condition_ids, max_markets_for_oi_holders)
     oi_holders_market_count = len(oi_condition_ids)
-    if oi_holders_market_count > 0:
-        try:
-            collector.fetch_open_interest(condition_ids=oi_condition_ids)
-        except Exception as exc:  # noqa: BLE001
-            collection_warnings.append(f"fetch_open_interest_failed:{exc}")
+    books_hot_snapshot_count = 0
+    books_cold_snapshot_count = 0
+    history_snapshot_asset_count = 0
 
-        try:
-            collector.fetch_holders(condition_ids=oi_condition_ids)
-        except Exception as exc:  # noqa: BLE001
-            collection_warnings.append(f"fetch_holders_failed:{exc}")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, rest_worker_count)) as executor:
+        futures: dict[str, concurrent.futures.Future[Any]] = {
+            "books": executor.submit(
+                _collect_tiered_book_snapshots,
+                collector_factory=collector_factory,
+                asset_ids=tracked_asset_ids,
+                max_assets_for_books=max_assets_for_books,
+                hot_assets_for_books=hot_assets_for_books,
+                hot_snapshot_interval_seconds=hot_snapshot_interval_seconds,
+                cold_snapshot_interval_seconds=cold_snapshot_interval_seconds,
+                snapshot_state=snapshot_state,
+                collect_midpoints=collect_midpoints,
+                collect_spreads=collect_spreads,
+            ),
+            "history": executor.submit(
+                _collect_history_snapshots,
+                collector_factory=collector_factory,
+                asset_ids=tracked_asset_ids,
+                max_assets_for_history=max_assets_for_history,
+                history_snapshot_interval_seconds=history_snapshot_interval_seconds,
+                history_window_seconds=history_window_seconds,
+                history_interval=history_interval,
+                history_fidelity=history_fidelity,
+                snapshot_state=snapshot_state,
+            ),
+        }
+        if oi_holders_market_count > 0:
+            futures["oi"] = executor.submit(
+                _run_open_interest_snapshot,
+                collector_factory=collector_factory,
+                condition_ids=oi_condition_ids,
+            )
+            futures["holders"] = executor.submit(
+                _run_holders_snapshot,
+                collector_factory=collector_factory,
+                condition_ids=oi_condition_ids,
+            )
 
-    try:
-        history_snapshot_asset_count = _collect_history_snapshots(
-            collector=collector,
-            asset_ids=tracked_asset_ids,
-            max_assets_for_history=max_assets_for_history,
-            history_snapshot_interval_seconds=history_snapshot_interval_seconds,
-            history_window_seconds=history_window_seconds,
-            history_interval=history_interval,
-            history_fidelity=history_fidelity,
-            snapshot_state=snapshot_state,
-        )
-    except Exception as exc:  # noqa: BLE001
-        history_snapshot_asset_count = 0
-        collection_warnings.append(f"history_snapshot_failed:{exc}")
+        for name, future in futures.items():
+            try:
+                result = future.result()
+            except Exception as exc:  # noqa: BLE001
+                if name == "books":
+                    collection_warnings.append(f"book_snapshot_failed:{exc}")
+                elif name == "history":
+                    collection_warnings.append(f"history_snapshot_failed:{exc}")
+                elif name == "oi":
+                    collection_warnings.append(f"fetch_open_interest_failed:{exc}")
+                elif name == "holders":
+                    collection_warnings.append(f"fetch_holders_failed:{exc}")
+                continue
+
+            if name == "books":
+                books_hot_snapshot_count, books_cold_snapshot_count = result
+            elif name == "history":
+                history_snapshot_asset_count = result
 
     ws_asset_ids = _limit_items(tracked_asset_ids, max_assets_for_ws)
-    if ws_asset_ids:
+    if collect_ws_inline and ws_asset_ids:
         try:
             collector.stream_market(
                 asset_ids=ws_asset_ids,
@@ -519,54 +716,56 @@ def _collect_cycle(
     # 2) Bootstrap collection for newly discovered markets/tokens.
     bootstrap_trade_condition_ids = tracked_added_condition_ids if freeze_tracked_markets else new_condition_ids
     if bootstrap_trade_condition_ids:
-        try:
-            bootstrap_trade_condition_ids = _limit_items(bootstrap_trade_condition_ids, max_markets_for_trades)
-            if full_trades_for_tracked_markets:
-                _, _, trade_frontier, hit_trade_offset_cap = collector.fetch_trades_incremental(
-                    condition_ids=bootstrap_trade_condition_ids,
-                    frontier_by_condition=trade_frontier,
-                    page_limit=trade_page_limit,
-                    max_offset=trade_max_offset,
-                    taker_only=False,
-                )
-                if hit_trade_offset_cap:
-                    collection_warnings.append("bootstrap_fetch_trades_reached_offset_cap")
-            else:
-                collector.fetch_trades(
-                    condition_ids=bootstrap_trade_condition_ids,
-                    limit=trade_page_limit,
-                    taker_only=False,
-                )
-        except Exception as exc:  # noqa: BLE001
-            collection_warnings.append(f"bootstrap_fetch_trades_failed:{exc}")
+        bootstrap_trade_condition_ids = _limit_items(bootstrap_trade_condition_ids, max_markets_for_trades)
+        trade_frontier, bootstrap_hit_trade_offset_cap, bootstrap_trade_warnings = _collect_trade_batches(
+            collector_factory=collector_factory,
+            condition_ids=bootstrap_trade_condition_ids,
+            full_trades_for_tracked_markets=full_trades_for_tracked_markets,
+            trade_page_limit=trade_page_limit,
+            trade_max_offset=trade_max_offset,
+            trade_frontier=trade_frontier,
+            trade_worker_count=trade_worker_count,
+            warning_prefix="bootstrap_fetch_trades",
+            on_trade_frontier_update=on_trade_frontier_update,
+        )
+        collection_warnings.extend(bootstrap_trade_warnings)
+        if bootstrap_hit_trade_offset_cap:
+            collection_warnings.append("bootstrap_fetch_trades_reached_offset_cap")
 
     bootstrap_warnings: list[str] = []
     bootstrap_asset_ids = tracked_added_asset_ids if freeze_tracked_markets else new_asset_ids
     if bootstrap_asset_ids:
         bootstrap_assets = _limit_items(bootstrap_asset_ids, max_assets_for_books)
-        try:
-            collector.fetch_books(token_ids=bootstrap_assets)
-            if collect_midpoints:
-                collector.fetch_midpoints(token_ids=bootstrap_assets)
-            if collect_spreads:
-                collector.fetch_spreads(token_ids=bootstrap_assets)
-        except Exception as exc:  # noqa: BLE001
-            bootstrap_warnings.append(f"bootstrap_books_failed:{exc}")
-
         bootstrap_history_assets = _limit_items(bootstrap_assets, max_assets_for_history)
-        if bootstrap_history_assets and new_market_backfill_seconds > 0:
-            now_ts = int(datetime.now(UTC).timestamp())
-            start_ts = now_ts - max(new_market_backfill_seconds, 60)
-            try:
-                collector.fetch_batch_prices_history(
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(rest_worker_count, 2))) as executor:
+            futures = {
+                "bootstrap_books": executor.submit(
+                    _collect_bootstrap_books,
+                    collector_factory=collector_factory,
+                    bootstrap_assets=bootstrap_assets,
+                    collect_midpoints=collect_midpoints,
+                    collect_spreads=collect_spreads,
+                )
+            }
+            if bootstrap_history_assets and new_market_backfill_seconds > 0:
+                now_ts = int(datetime.now(UTC).timestamp())
+                start_ts = now_ts - max(new_market_backfill_seconds, 60)
+                futures["bootstrap_history"] = executor.submit(
+                    _collect_bootstrap_history,
+                    collector_factory=collector_factory,
                     token_ids=bootstrap_history_assets,
                     start_ts=start_ts,
                     end_ts=now_ts,
-                    interval="1m",
-                    fidelity=1,
                 )
-            except Exception as exc:  # noqa: BLE001
-                bootstrap_warnings.append(f"batch_prices_history_failed:{exc}")
+
+            for name, future in futures.items():
+                try:
+                    future.result()
+                except Exception as exc:  # noqa: BLE001
+                    if name == "bootstrap_books":
+                        bootstrap_warnings.append(f"bootstrap_books_failed:{exc}")
+                    else:
+                        bootstrap_warnings.append(f"batch_prices_history_failed:{exc}")
 
     return {
         "current_state": current_state,
@@ -589,9 +788,20 @@ def _collect_cycle(
     }
 
 
+def _clone_tracked_market_selection(selection: TrackedMarketSelection) -> TrackedMarketSelection:
+    return TrackedMarketSelection(
+        condition_ids=list(selection.condition_ids),
+        asset_ids=list(selection.asset_ids),
+        added_condition_ids=list(selection.added_condition_ids),
+        removed_condition_ids=list(selection.removed_condition_ids),
+        added_asset_ids=list(selection.added_asset_ids),
+        removed_asset_ids=list(selection.removed_asset_ids),
+    )
+
+
 def _collect_tiered_book_snapshots(
     *,
-    collector: PolymarketCollector,
+    collector_factory: Any,
     asset_ids: list[str],
     max_assets_for_books: int,
     hot_assets_for_books: int,
@@ -604,6 +814,7 @@ def _collect_tiered_book_snapshots(
     assets = _limit_items(asset_ids, max_assets_for_books)
     if not assets:
         return 0, 0
+    collector = collector_factory()
 
     hot_count = max(0, min(hot_assets_for_books, len(assets)))
     hot_assets = assets[:hot_count]
@@ -638,9 +849,26 @@ def _collect_tiered_book_snapshots(
     return len(hot_assets) if hot_due else 0, len(cold_assets) if cold_due else 0
 
 
+def _collect_bootstrap_books(
+    *,
+    collector_factory: Any,
+    bootstrap_assets: list[str],
+    collect_midpoints: bool,
+    collect_spreads: bool,
+) -> None:
+    if not bootstrap_assets:
+        return
+    collector = collector_factory()
+    collector.fetch_books(token_ids=bootstrap_assets)
+    if collect_midpoints:
+        collector.fetch_midpoints(token_ids=bootstrap_assets)
+    if collect_spreads:
+        collector.fetch_spreads(token_ids=bootstrap_assets)
+
+
 def _collect_history_snapshots(
     *,
-    collector: PolymarketCollector,
+    collector_factory: Any,
     asset_ids: list[str],
     max_assets_for_history: int,
     history_snapshot_interval_seconds: int,
@@ -652,6 +880,7 @@ def _collect_history_snapshots(
     assets = _limit_items(asset_ids, max_assets_for_history)
     if not assets or history_snapshot_interval_seconds <= 0:
         return 0
+    collector = collector_factory()
 
     now = time.monotonic()
     due = (
@@ -674,10 +903,162 @@ def _collect_history_snapshots(
     return len(assets)
 
 
+def _build_parallel_collector_factory(collector: Any) -> Any:
+    config = getattr(collector, "config", None)
+    if isinstance(config, CollectorConfig):
+        return lambda: PolymarketCollector(config)
+    return lambda: collector
+
+
+def _collect_trade_batches(
+    *,
+    collector_factory: Any,
+    condition_ids: list[str],
+    full_trades_for_tracked_markets: bool,
+    trade_page_limit: int,
+    trade_max_offset: int,
+    trade_frontier: dict[str, Any],
+    trade_worker_count: int,
+    warning_prefix: str,
+    on_trade_frontier_update: Any | None,
+) -> tuple[dict[str, Any], bool, list[str]]:
+    if not condition_ids:
+        return trade_frontier, False, []
+
+    warnings: list[str] = []
+    hit_trade_offset_cap = False
+
+    trade_batches = [
+        batch
+        for batch in (
+            _shard_items(values=condition_ids, shard_count=max(1, trade_worker_count), shard_index=worker_index)
+            for worker_index in range(max(1, trade_worker_count))
+        )
+        if batch
+    ]
+    if not trade_batches:
+        return trade_frontier, False, []
+
+    frontier_state = dict(trade_frontier)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(len(trade_batches), trade_worker_count))) as executor:
+        futures: dict[concurrent.futures.Future[Any], list[str]] = {}
+        for batch in trade_batches:
+            if full_trades_for_tracked_markets:
+                batch_frontier = {
+                    condition_id: frontier_state[condition_id]
+                    for condition_id in batch
+                    if condition_id in frontier_state
+                }
+                future = executor.submit(
+                    _run_incremental_trade_batch,
+                    collector_factory=collector_factory,
+                    condition_ids=batch,
+                    frontier_by_condition=batch_frontier,
+                    trade_page_limit=trade_page_limit,
+                    trade_max_offset=trade_max_offset,
+                )
+            else:
+                future = executor.submit(
+                    _run_recent_trade_batch,
+                    collector_factory=collector_factory,
+                    condition_ids=batch,
+                    trade_page_limit=trade_page_limit,
+                )
+            futures[future] = batch
+
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                batch_frontier, batch_hit_offset_cap = future.result()
+            except Exception as exc:  # noqa: BLE001
+                warnings.append(f"{warning_prefix}_failed:{exc}")
+                continue
+
+            hit_trade_offset_cap = hit_trade_offset_cap or batch_hit_offset_cap
+            if not full_trades_for_tracked_markets:
+                continue
+
+            frontier_state.update(batch_frontier)
+            if on_trade_frontier_update is not None:
+                try:
+                    on_trade_frontier_update(frontier_state)
+                except Exception as exc:  # noqa: BLE001
+                    warnings.append(f"{warning_prefix}_checkpoint_failed:{exc}")
+
+    return frontier_state, hit_trade_offset_cap, warnings
+
+
+def _run_incremental_trade_batch(
+    *,
+    collector_factory: Any,
+    condition_ids: list[str],
+    frontier_by_condition: dict[str, Any],
+    trade_page_limit: int,
+    trade_max_offset: int,
+) -> tuple[dict[str, Any], bool]:
+    collector = collector_factory()
+    _, _, batch_frontier, hit_trade_offset_cap = collector.fetch_trades_incremental(
+        condition_ids=condition_ids,
+        frontier_by_condition=frontier_by_condition,
+        page_limit=trade_page_limit,
+        max_offset=trade_max_offset,
+        taker_only=False,
+    )
+    return batch_frontier, hit_trade_offset_cap
+
+
+def _run_recent_trade_batch(
+    *,
+    collector_factory: Any,
+    condition_ids: list[str],
+    trade_page_limit: int,
+) -> tuple[dict[str, Any], bool]:
+    collector = collector_factory()
+    collector.fetch_trades(
+        condition_ids=condition_ids,
+        limit=trade_page_limit,
+        taker_only=False,
+    )
+    return {}, False
+
+
+def _run_open_interest_snapshot(*, collector_factory: Any, condition_ids: list[str]) -> tuple[list[dict[str, Any]], Path | None]:
+    collector = collector_factory()
+    return collector.fetch_open_interest(condition_ids=condition_ids)
+
+
+def _run_holders_snapshot(*, collector_factory: Any, condition_ids: list[str]) -> tuple[list[dict[str, Any]], Path | None]:
+    collector = collector_factory()
+    return collector.fetch_holders(condition_ids=condition_ids)
+
+
+def _collect_bootstrap_history(
+    *,
+    collector_factory: Any,
+    token_ids: list[str],
+    start_ts: int,
+    end_ts: int,
+) -> tuple[dict[str, Any], Path | None]:
+    collector = collector_factory()
+    return collector.fetch_batch_prices_history(
+        token_ids=token_ids,
+        start_ts=start_ts,
+        end_ts=end_ts,
+        interval="1m",
+        fidelity=1,
+    )
+
+
 def _limit_items(values: list[str], limit: int) -> list[str]:
     if limit <= 0:
         return list(values)
     return values[:limit]
+
+
+def _shard_items(*, values: list[str], shard_count: int, shard_index: int) -> list[str]:
+    normalized_shard_count = max(1, shard_count)
+    normalized_shard_index = max(0, shard_index)
+    return list(values[normalized_shard_index::normalized_shard_count])
 
 
 def _load_universe_state(data_root: Path) -> UniverseState:

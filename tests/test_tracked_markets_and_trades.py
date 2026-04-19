@@ -15,6 +15,7 @@ from polymarket_collector.runtime import (
     UniverseState,
     _collect_cycle,
     _resolve_tracked_market_selection,
+    _shard_items,
     _update_tracked_selection_from_ws_event,
 )
 
@@ -254,6 +255,81 @@ class TrackedMarketsAndTradesTests(unittest.TestCase):
         self.assertNotIn("fetch_spreads", call_names)
         self.assertNotIn("fetch_batch_prices_history", call_names)
 
+    def test_collect_cycle_can_skip_inline_ws_when_background_worker_is_enabled(self) -> None:
+        class DummyCollector:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, list[str] | None]] = []
+
+            @staticmethod
+            def extract_condition_ids(markets: list[dict[str, object]]) -> list[str]:
+                return [str(m["conditionId"]) for m in markets]
+
+            @staticmethod
+            def extract_asset_ids(markets: list[dict[str, object]]) -> list[str]:
+                values: list[str] = []
+                for market in markets:
+                    values.extend(list(market["clobTokenIds"]))
+                return values
+
+            def fetch_trades_incremental(self, **kwargs):
+                self.calls.append(("fetch_trades_incremental", list(kwargs["condition_ids"])))
+                return [], None, {}, False
+
+            def fetch_open_interest(self, **kwargs):
+                self.calls.append(("fetch_open_interest", list(kwargs["condition_ids"])))
+
+            def fetch_holders(self, **kwargs):
+                self.calls.append(("fetch_holders", list(kwargs["condition_ids"])))
+
+            def fetch_books(self, **kwargs):
+                self.calls.append(("fetch_books", list(kwargs["token_ids"])))
+
+            def fetch_batch_prices_history(self, **kwargs):
+                self.calls.append(("fetch_batch_prices_history", list(kwargs["token_ids"])))
+
+            def stream_market(self, **kwargs):
+                self.calls.append(("stream_market", list(kwargs["asset_ids"])))
+
+        collector = DummyCollector()
+        markets = [{"conditionId": "cond-a", "clobTokenIds": ["tok-a-1", "tok-a-2"]}]
+        _collect_cycle(
+            collector=collector,
+            markets=markets,
+            previous_state=UniverseState(condition_ids=set(), asset_ids=set()),
+            max_markets_for_trades=10,
+            max_markets_for_oi_holders=10,
+            max_assets_for_books=10,
+            hot_assets_for_books=0,
+            hot_snapshot_interval_seconds=300,
+            cold_snapshot_interval_seconds=300,
+            max_assets_for_history=0,
+            history_snapshot_interval_seconds=0,
+            history_window_seconds=900,
+            history_interval="all",
+            history_fidelity=1,
+            max_assets_for_ws=10,
+            ws_duration_seconds=5,
+            new_market_backfill_seconds=0,
+            snapshot_state=SnapshotScheduleState(),
+            tracked_selection=TrackedMarketSelection(
+                condition_ids=["cond-a"],
+                asset_ids=["tok-a-1", "tok-a-2"],
+                added_condition_ids=[],
+                added_asset_ids=[],
+            ),
+            freeze_tracked_markets=True,
+            full_trades_for_tracked_markets=True,
+            trade_page_limit=500,
+            trade_max_offset=10000,
+            trade_frontier={},
+            collect_midpoints=False,
+            collect_spreads=False,
+            collect_ws_inline=False,
+        )
+
+        call_names = [name for name, _ in collector.calls]
+        self.assertNotIn("stream_market", call_names)
+
     def test_ws_event_updates_tracked_selection_immediately(self) -> None:
         selection = TrackedMarketSelection(
             condition_ids=["cond-a"],
@@ -359,8 +435,9 @@ class TrackedMarketsAndTradesTests(unittest.TestCase):
             collect_spreads=False,
         )
 
-        calls = dict(collector.calls)
-        self.assertEqual(calls["fetch_trades_incremental"], ["cond-a", "cond-b"])
+        trade_batches = [batch for name, batch in collector.calls if name == "fetch_trades_incremental"]
+        self.assertEqual(sorted(item for batch in trade_batches for item in batch), ["cond-a", "cond-b"])
+        calls = dict((name, values) for name, values in collector.calls if name != "fetch_trades_incremental")
         self.assertEqual(calls["fetch_open_interest"], ["cond-a", "cond-b"])
         self.assertEqual(calls["fetch_holders"], ["cond-a", "cond-b"])
         self.assertEqual(calls["fetch_books"], ["tok-a-1", "tok-a-2", "tok-b-1", "tok-b-2"])
@@ -438,6 +515,190 @@ class TrackedMarketsAndTradesTests(unittest.TestCase):
         )
 
         self.assertEqual(collector.history_calls, [["tok-a-1", "tok-a-2"]])
+
+    def test_shard_items_splits_assets_evenly_for_ws_workers(self) -> None:
+        values = ["a0", "a1", "a2", "a3", "a4", "a5", "a6"]
+        self.assertEqual(_shard_items(values=values, shard_count=3, shard_index=0), ["a0", "a3", "a6"])
+        self.assertEqual(_shard_items(values=values, shard_count=3, shard_index=1), ["a1", "a4"])
+        self.assertEqual(_shard_items(values=values, shard_count=3, shard_index=2), ["a2", "a5"])
+
+    def test_collect_cycle_parallel_rest_tasks_continue_when_one_task_fails(self) -> None:
+        class DummyCollector:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, list[str]]] = []
+
+            @staticmethod
+            def extract_condition_ids(markets: list[dict[str, object]]) -> list[str]:
+                return [str(m["conditionId"]) for m in markets]
+
+            @staticmethod
+            def extract_asset_ids(markets: list[dict[str, object]]) -> list[str]:
+                values: list[str] = []
+                for market in markets:
+                    values.extend(list(market["clobTokenIds"]))
+                return values
+
+            def fetch_trades_incremental(self, **kwargs):
+                self.calls.append(("fetch_trades_incremental", list(kwargs["condition_ids"])))
+                return [], None, {}, False
+
+            def fetch_open_interest(self, **kwargs):
+                raise RuntimeError("oi down")
+
+            def fetch_holders(self, **kwargs):
+                self.calls.append(("fetch_holders", list(kwargs["condition_ids"])))
+
+            def fetch_books(self, **kwargs):
+                self.calls.append(("fetch_books", list(kwargs["token_ids"])))
+
+            def fetch_batch_prices_history(self, **kwargs):
+                self.calls.append(("fetch_batch_prices_history", list(kwargs["token_ids"])))
+                return {}, None
+
+            def stream_market(self, **kwargs):
+                self.calls.append(("stream_market", list(kwargs["asset_ids"])))
+
+        collector = DummyCollector()
+        result = _collect_cycle(
+            collector=collector,
+            markets=[{"conditionId": "cond-a", "clobTokenIds": ["tok-a-1", "tok-a-2"]}],
+            previous_state=UniverseState(condition_ids=set(), asset_ids=set()),
+            max_markets_for_trades=10,
+            max_markets_for_oi_holders=10,
+            max_assets_for_books=10,
+            hot_assets_for_books=0,
+            hot_snapshot_interval_seconds=300,
+            cold_snapshot_interval_seconds=300,
+            max_assets_for_history=10,
+            history_snapshot_interval_seconds=60,
+            history_window_seconds=900,
+            history_interval="all",
+            history_fidelity=1,
+            max_assets_for_ws=10,
+            ws_duration_seconds=5,
+            new_market_backfill_seconds=0,
+            snapshot_state=SnapshotScheduleState(),
+            tracked_selection=TrackedMarketSelection(
+                condition_ids=["cond-a"],
+                asset_ids=["tok-a-1", "tok-a-2"],
+                added_condition_ids=[],
+                added_asset_ids=[],
+            ),
+            freeze_tracked_markets=True,
+            full_trades_for_tracked_markets=True,
+            trade_page_limit=500,
+            trade_max_offset=3000,
+            trade_frontier={},
+            collect_midpoints=False,
+            collect_spreads=False,
+            rest_worker_count=4,
+        )
+
+        self.assertIn("fetch_open_interest_failed:oi down", result["collection_warnings"])
+        call_names = [name for name, _ in collector.calls]
+        self.assertIn("fetch_holders", call_names)
+        self.assertIn("fetch_books", call_names)
+        self.assertIn("fetch_batch_prices_history", call_names)
+
+    def test_collect_cycle_trade_workers_checkpoint_frontier_per_batch(self) -> None:
+        class DummyCollector:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, list[str]]] = []
+
+            @staticmethod
+            def extract_condition_ids(markets: list[dict[str, object]]) -> list[str]:
+                return [str(m["conditionId"]) for m in markets]
+
+            @staticmethod
+            def extract_asset_ids(markets: list[dict[str, object]]) -> list[str]:
+                values: list[str] = []
+                for market in markets:
+                    values.extend(list(market["clobTokenIds"]))
+                return values
+
+            def fetch_trades_incremental(self, **kwargs):
+                batch = list(kwargs["condition_ids"])
+                self.calls.append(("fetch_trades_incremental", batch))
+                frontier = {
+                    condition_id: {
+                        "max_timestamp": len(condition_id),
+                        "keys_at_max_timestamp": [f"{condition_id}|frontier"],
+                    }
+                    for condition_id in batch
+                }
+                return [], None, frontier, False
+
+            def fetch_open_interest(self, **kwargs):
+                return [], None
+
+            def fetch_holders(self, **kwargs):
+                return [], None
+
+            def fetch_books(self, **kwargs):
+                return [], None
+
+            def fetch_batch_prices_history(self, **kwargs):
+                return {}, None
+
+            def stream_market(self, **kwargs):
+                return 0
+
+        collector = DummyCollector()
+        checkpoint_snapshots: list[dict[str, object]] = []
+        result = _collect_cycle(
+            collector=collector,
+            markets=[
+                {"conditionId": "cond-a", "clobTokenIds": ["tok-a-1"]},
+                {"conditionId": "cond-b", "clobTokenIds": ["tok-b-1"]},
+                {"conditionId": "cond-c", "clobTokenIds": ["tok-c-1"]},
+                {"conditionId": "cond-d", "clobTokenIds": ["tok-d-1"]},
+            ],
+            previous_state=UniverseState(condition_ids=set(), asset_ids=set()),
+            max_markets_for_trades=0,
+            max_markets_for_oi_holders=0,
+            max_assets_for_books=0,
+            hot_assets_for_books=0,
+            hot_snapshot_interval_seconds=300,
+            cold_snapshot_interval_seconds=300,
+            max_assets_for_history=0,
+            history_snapshot_interval_seconds=0,
+            history_window_seconds=900,
+            history_interval="all",
+            history_fidelity=1,
+            max_assets_for_ws=0,
+            ws_duration_seconds=5,
+            new_market_backfill_seconds=0,
+            snapshot_state=SnapshotScheduleState(),
+            tracked_selection=TrackedMarketSelection(
+                condition_ids=["cond-a", "cond-b", "cond-c", "cond-d"],
+                asset_ids=["tok-a-1", "tok-b-1", "tok-c-1", "tok-d-1"],
+                added_condition_ids=[],
+                added_asset_ids=[],
+            ),
+            freeze_tracked_markets=True,
+            full_trades_for_tracked_markets=True,
+            trade_page_limit=500,
+            trade_max_offset=3000,
+            trade_frontier={},
+            collect_midpoints=False,
+            collect_spreads=False,
+            rest_worker_count=1,
+            trade_worker_count=2,
+            on_trade_frontier_update=lambda frontier: checkpoint_snapshots.append(
+                json.loads(json.dumps(frontier, ensure_ascii=True))
+            ),
+        )
+
+        self.assertEqual(len(checkpoint_snapshots), 2)
+        self.assertEqual(sorted(len(snapshot) for snapshot in checkpoint_snapshots), [2, 4])
+        self.assertEqual(
+            sorted(result["trade_frontier"].keys()),
+            ["cond-a", "cond-b", "cond-c", "cond-d"],
+        )
+        self.assertEqual(
+            sorted(batch for name, batch in collector.calls if name == "fetch_trades_incremental"),
+            [["cond-a", "cond-c"], ["cond-b", "cond-d"]],
+        )
 
 
 if __name__ == "__main__":

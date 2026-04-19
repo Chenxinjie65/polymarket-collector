@@ -21,9 +21,14 @@ dist/
 data/
 data_demo/
 data_test/
+data_10m_bench*/
+data_bench_fullcycle*/
+data_ws_smoke*/
 tmp/
 logs/
 *.log
+*.pid
+*.meta
 
 # OS/editor
 .DS_Store

@@ -9,7 +9,7 @@ from typing import Any
 from polymarket_collector.backfill import backfill_raw_partitions
 from polymarket_collector.collector import CollectorConfig, PolymarketCollector
 from polymarket_collector.dedup import build_dedup_report
-from polymarket_collector.parquet_build import build_parquet_from_raw
+from polymarket_collector.parquet_build import build_normalized_parquet_from_raw, build_parquet_from_raw
 from polymarket_collector.runtime import run_backup_loop, run_primary_loop
 from polymarket_collector.state_ops import (
     evaluate_failover,
@@ -131,6 +131,9 @@ def main() -> int:
         message_count = collector.stream_market(
             asset_ids=asset_ids,
             duration_seconds=args.duration_seconds,
+            flush_every_messages=args.flush_every_messages,
+            flush_every_seconds=args.flush_every_seconds,
+            subscribe_batch_size=args.subscribe_batch_size,
         )
         print(f"streamed_messages={message_count}")
         return 0
@@ -222,6 +225,24 @@ def main() -> int:
         print(json.dumps(stats.as_dict(), ensure_ascii=True))
         return 0
 
+    if args.command == "build-parquet-normalized":
+        start = _parse_iso_datetime(args.start) if args.start else None
+        end = _parse_iso_datetime(args.end) if args.end else None
+        try:
+            stats = build_normalized_parquet_from_raw(
+                data_root=Path(args.data_root),
+                sources=_parse_sources(args.sources),
+                start=start,
+                end=end,
+                overwrite=args.overwrite,
+                dedup=not args.no_dedup,
+            )
+        except RuntimeError as exc:
+            print(str(exc))
+            return 1
+        print(json.dumps(stats.as_dict(), ensure_ascii=True))
+        return 0
+
     if args.command == "run-primary":
         run_primary_loop(
             collector=collector,
@@ -243,6 +264,12 @@ def main() -> int:
             history_fidelity=args.history_fidelity,
             max_assets_for_ws=args.max_assets_for_ws,
             ws_duration_seconds=args.ws_duration_seconds,
+            ws_worker_count=args.ws_worker_count,
+            ws_flush_every_messages=args.ws_flush_every_messages,
+            ws_flush_every_seconds=args.ws_flush_every_seconds,
+            ws_subscribe_batch_size=args.ws_subscribe_batch_size,
+            rest_worker_count=args.rest_worker_count,
+            trade_worker_count=args.trade_worker_count,
             discover_all_pages=args.discover_all_pages,
             page_limit=args.page_limit,
             new_market_backfill_seconds=args.new_market_backfill_seconds,
@@ -279,6 +306,12 @@ def main() -> int:
             history_fidelity=args.history_fidelity,
             max_assets_for_ws=args.max_assets_for_ws,
             ws_duration_seconds=args.ws_duration_seconds,
+            ws_worker_count=args.ws_worker_count,
+            ws_flush_every_messages=args.ws_flush_every_messages,
+            ws_flush_every_seconds=args.ws_flush_every_seconds,
+            ws_subscribe_batch_size=args.ws_subscribe_batch_size,
+            rest_worker_count=args.rest_worker_count,
+            trade_worker_count=args.trade_worker_count,
             discover_all_pages=args.discover_all_pages,
             page_limit=args.page_limit,
             new_market_backfill_seconds=args.new_market_backfill_seconds,
@@ -376,6 +409,14 @@ def build_parser() -> argparse.ArgumentParser:
     stream.add_argument("--markets-file", default="latest", help="Path to markets JSON or 'latest'")
     stream.add_argument("--max-assets", type=int, default=10, help="Maximum number of asset IDs; <=0 means all")
     stream.add_argument("--duration-seconds", type=int, default=60, help="Streaming duration")
+    stream.add_argument("--flush-every-messages", type=int, default=50, help="Flush ws records after N messages")
+    stream.add_argument("--flush-every-seconds", type=int, default=5, help="Flush ws records after N seconds")
+    stream.add_argument(
+        "--subscribe-batch-size",
+        type=int,
+        default=500,
+        help="Maximum asset IDs per ws subscribe frame",
+    )
 
     hb = subparsers.add_parser("heartbeat", help="Write one heartbeat state file")
     hb.add_argument("--node-id", default="local-primary", help="Node identifier")
@@ -457,6 +498,20 @@ def build_parser() -> argparse.ArgumentParser:
     parquet_cmd.add_argument("--overwrite", action="store_true", help="Rewrite existing parquet files")
     parquet_cmd.add_argument("--no-dedup", action="store_true", help="Disable per-file dedup during build")
 
+    parquet_norm_cmd = subparsers.add_parser(
+        "build-parquet-normalized",
+        help="Build normalized parquet tables for selected sources (currently data_trades, ws_market)",
+    )
+    parquet_norm_cmd.add_argument(
+        "--sources",
+        default="data_trades,ws_market",
+        help="Comma-separated sources; currently supports data_trades,ws_market",
+    )
+    parquet_norm_cmd.add_argument("--start", default=None, help="Optional start time ISO8601")
+    parquet_norm_cmd.add_argument("--end", default=None, help="Optional end time ISO8601")
+    parquet_norm_cmd.add_argument("--overwrite", action="store_true", help="Rewrite existing parquet files")
+    parquet_norm_cmd.add_argument("--no-dedup", action="store_true", help="Disable per-file dedup during build")
+
     primary = subparsers.add_parser("run-primary", help="Run primary collector loop with heartbeat")
     primary.add_argument("--node-id", default="local-primary", help="Primary node id")
     primary.add_argument("--interval-seconds", type=int, default=300, help="Cycle interval")
@@ -529,6 +584,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     primary.add_argument("--max-assets-for-ws", type=int, default=0, help="Max assets for WS stream; <=0 means all")
     primary.add_argument("--ws-duration-seconds", type=int, default=60, help="WS duration per cycle")
+    primary.add_argument("--ws-worker-count", type=int, default=4, help="Number of background ws shard workers")
+    primary.add_argument("--ws-flush-every-messages", type=int, default=50, help="Flush ws records after N messages")
+    primary.add_argument("--ws-flush-every-seconds", type=int, default=5, help="Flush ws records after N seconds")
+    primary.add_argument(
+        "--ws-subscribe-batch-size",
+        type=int,
+        default=500,
+        help="Maximum asset IDs per ws subscribe frame",
+    )
+    primary.add_argument("--rest-worker-count", type=int, default=4, help="Number of parallel REST task workers")
+    primary.add_argument(
+        "--trade-worker-count",
+        type=int,
+        default=4,
+        help="Number of parallel trade sync workers",
+    )
     primary.add_argument(
         "--discover-all-pages",
         action="store_true",
@@ -560,7 +631,7 @@ def build_parser() -> argparse.ArgumentParser:
     primary.add_argument(
         "--trade-max-offset",
         type=int,
-        default=10000,
+        default=3000,
         help="Maximum offset walked during one incremental trade sync",
     )
     primary.add_argument(
@@ -648,6 +719,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     backup.add_argument("--max-assets-for-ws", type=int, default=0, help="Max assets for WS stream; <=0 means all")
     backup.add_argument("--ws-duration-seconds", type=int, default=60, help="WS duration per active cycle")
+    backup.add_argument("--ws-worker-count", type=int, default=4, help="Number of background ws shard workers")
+    backup.add_argument("--ws-flush-every-messages", type=int, default=50, help="Flush ws records after N messages")
+    backup.add_argument("--ws-flush-every-seconds", type=int, default=5, help="Flush ws records after N seconds")
+    backup.add_argument(
+        "--ws-subscribe-batch-size",
+        type=int,
+        default=500,
+        help="Maximum asset IDs per ws subscribe frame",
+    )
+    backup.add_argument("--rest-worker-count", type=int, default=4, help="Number of parallel REST task workers")
+    backup.add_argument(
+        "--trade-worker-count",
+        type=int,
+        default=4,
+        help="Number of parallel trade sync workers",
+    )
     backup.add_argument(
         "--discover-all-pages",
         action="store_true",
@@ -679,7 +766,7 @@ def build_parser() -> argparse.ArgumentParser:
     backup.add_argument(
         "--trade-max-offset",
         type=int,
-        default=10000,
+        default=3000,
         help="Maximum offset walked during one incremental trade sync",
     )
     backup.add_argument(
