@@ -57,6 +57,12 @@ python -m polymarket_collector fetch-oi --markets-file latest --max-markets 20
 python -m polymarket_collector fetch-holders --markets-file latest --max-markets 20
 ```
 
+全市场补扫（active + closed + archived，输出 `latest_markets_all.json`）：
+
+```bash
+python -m polymarket_collector discover-markets-universe --page-limit 500
+```
+
 使用官方 CLOB 驱动抓盘口：
 
 ```bash
@@ -105,6 +111,8 @@ python -m polymarket_collector run-primary \
   --node-id local-primary \
   --interval-seconds 60 \
   --discover-all-pages \
+  --include-closed-markets \
+  --include-archived-markets \
   --freeze-tracked-markets \
   --full-trades-for-tracked-markets \
   --page-limit 500 \
@@ -190,19 +198,34 @@ PM_DATA_ROOT=data_run4 PM_DURATION_SECONDS=21600 PM_LOG_FILE=run_primary_run4.lo
 - `PM_MAX_ASSETS_FOR_WS=0`（`<=0` 表示全量）
 - `PM_WS_DURATION_SECONDS=55`
 - `PM_WS_WORKER_COUNT=4`
-- `PM_WS_FLUSH_EVERY_MESSAGES=50`
-- `PM_WS_FLUSH_EVERY_SECONDS=5`
+- `PM_WS_FLUSH_EVERY_MESSAGES=10`
+- `PM_WS_FLUSH_EVERY_SECONDS=1`
 - `PM_WS_SUBSCRIBE_BATCH_SIZE=500`
 - `PM_REST_WORKER_COUNT=4`
 - `PM_TRADE_WORKER_COUNT=4`
 - `PM_NEW_MARKET_BACKFILL_SECONDS=0`
+- `PM_INCLUDE_CLOSED_MARKETS=1`
+- `PM_INCLUDE_ARCHIVED_MARKETS=1`
 - `PM_FREEZE_TRACKED_MARKETS=1`
 - `PM_FULL_TRADES_FOR_TRACKED_MARKETS=1`
 - `PM_COLLECT_MIDPOINTS=0`
 - `PM_COLLECT_SPREADS=0`
+- `PM_HTTP_MAX_RETRIES=5`
+- `PM_HTTP_BACKOFF_BASE_SECONDS=0.5`
+- `PM_HTTP_MAX_BACKOFF_SECONDS=8`
+- `PM_RAW_SOURCES=ws_market`（默认仅落盘 ws 原始流）
 - `PM_LOG_FILE=run_primary_12h_rich.log`
 - `PM_PID_FILE=.primary.pid`
 - `PM_KILL_EXISTING=1`
+
+运维控制脚本（推荐）：
+
+```bash
+bash scripts/collector_ctl.sh status
+bash scripts/collector_ctl.sh start
+bash scripts/collector_ctl.sh logs
+bash scripts/collector_ctl.sh stop
+```
 
 更新并重启（建议用于线上移交）：
 
@@ -266,19 +289,21 @@ data/raw/source=<source>/dt=YYYY-MM-DD/hour=HH/bucket_start=YYYYMMDDTHHMMSSZ_nod
 
 ```text
 <data-root>/latest_markets.json
+<data-root>/latest_markets_all.json
 <data-root>/state/heartbeat_<node>.json
 <data-root>/state/failover_state.json
 <data-root>/state/market_universe.json
 <data-root>/state/tracked_market_selection.json
 <data-root>/state/trade_frontier.json
 <data-root>/state/reports/dedup_report_*.json
+<data-root>/state/reports/runtime_quality_*.json
+<data-root>/state/reports/runtime_quality_latest.json
+<data-root>/state/reports/runtime_alerts.jsonl
 ```
 
 已写入的主要源：
 
 ```text
-gamma_markets
-gamma_events
 data_trades
 data_oi
 data_holders
@@ -286,14 +311,21 @@ clob_books
 ws_market
 ```
 
+注：`gamma_markets`、`gamma_events` 原始快照默认都不写入 `raw`；如需保留可通过 `--write-gamma-markets-raw`、`--write-gamma-events-raw` 显式开启。
+
 ## 重要实现约束
 
 - `--clob-driver pyclob` 只影响 CLOB 相关调用；缺依赖会快速失败。
+- `--raw-sources` 可控制 raw 落盘白名单；CLI 默认 `all`，`scripts/start_primary.sh` 默认 `PM_RAW_SOURCES=ws_market`。
+- `gamma_markets` 默认仅用于维护当前市场集合（`latest_markets.json` + `state/tracked_market_selection.json`），不落 `raw`；需要原始快照时可显式开启 `--write-gamma-markets-raw`。
+- `gamma_events` 默认仅用于更新 `latest_events.json`，不落 `raw`；需要原始快照时可显式开启 `--write-gamma-events-raw`。
 - 默认配置现在以 `ws_market` 为主实时流，`clob_books` 作为低频基准快照；`clob_midpoints`、`clob_spreads`、`clob_batch_prices_history` 默认关闭。
 - `run-primary` / `run-backup` 的 `ws_market` 为后台 worker 模式；默认 `ws-worker-count=4`。
 - `books` / `oi` / `holders` / `history` 默认通过 `rest-worker-count=4` 并发执行，且每个任务使用独立 collector。
 - `trades` 默认通过 `trade-worker-count=4` 分片并发执行；每个 batch 完成后会立即更新 `trade_frontier.json`。
-- 每个 WS worker 都会按 `flush_every_messages=50` 或 `flush_every_seconds=5` 落盘；文件仍按小时桶追加，不会每次 flush 新建文件。
+- 每个 WS worker 都会按 `flush_every_messages=10` 或 `flush_every_seconds=1` 落盘；文件仍按小时桶追加，不会每次 flush 新建文件。
+- HTTP 请求默认启用重试/退避（429/5xx、超时、连接失败），并支持 `Retry-After`。
+- `--include-closed-markets` / `--include-archived-markets` 可把非 active 市场纳入主循环发现范围。
 - `ws_market` 连接内会在收到 `new_market` 时立即追加订阅新市场资产，在收到 `market_resolved` 时立即取消该市场资产订阅；状态会回写到 `tracked_market_selection.json`。
 - 盘口采样仍然使用冷热参数，但默认 `hot_assets_for_books=0`，因此所有 book 快照都按低频基准节奏执行。
 - 对 `max_*` / `max_assets_*` / `max_markets_*` 类参数，`<=0` 统一表示“不限制（全量）”。
@@ -302,7 +334,7 @@ ws_market
 - `clob_batch_prices_history` 触发条件：
 - 周期快照：`history_snapshot_interval_seconds > 0` 时启用（`max_assets_for_history<=0` 表示对全部 tracked 资产）。
 - 新市场回补：`new_market_backfill_seconds > 0` 时启用（回补资产集合同样受 `max_assets_for_history`，`<=0` 为全量）。
-- `--freeze-tracked-markets` 会把跟踪集合持久化到 `tracked_market_selection.json`：保留仍然 active 的旧市场顺序，自动追加新 active 市场，自动移除 inactive/closed 市场。
+- `--freeze-tracked-markets` 会把跟踪集合持久化到 `tracked_market_selection.json`：保留当前发现集合中的旧市场顺序，自动追加新市场，自动移除不再被发现的市场。
 - `--full-trades-for-tracked-markets` 会对固定市场集合做分页增量同步，并把已追到的交易前沿写进 `trade_frontier.json`，用于重启后续抓。
 - `clob_batch_prices_history` 对时间参数有约束：当请求带 `start_ts/end_ts` 时，采集器会规范化 `interval` 为 `all`，并在必要时重试不带 `interval` 的请求。
 - writer 使用固定时间桶（默认 `3600` 秒）；跨机主备建议统一 `bucket_seconds` 和 `writer_node_id`。

@@ -42,16 +42,22 @@ HISTORY_FIDELITY="${PM_HISTORY_FIDELITY:-1}"
 MAX_ASSETS_FOR_WS="${PM_MAX_ASSETS_FOR_WS:-0}"
 WS_DURATION_SECONDS="${PM_WS_DURATION_SECONDS:-55}"
 WS_WORKER_COUNT="${PM_WS_WORKER_COUNT:-4}"
-WS_FLUSH_EVERY_MESSAGES="${PM_WS_FLUSH_EVERY_MESSAGES:-50}"
-WS_FLUSH_EVERY_SECONDS="${PM_WS_FLUSH_EVERY_SECONDS:-5}"
+WS_FLUSH_EVERY_MESSAGES="${PM_WS_FLUSH_EVERY_MESSAGES:-10}"
+WS_FLUSH_EVERY_SECONDS="${PM_WS_FLUSH_EVERY_SECONDS:-1}"
 WS_SUBSCRIBE_BATCH_SIZE="${PM_WS_SUBSCRIBE_BATCH_SIZE:-500}"
 REST_WORKER_COUNT="${PM_REST_WORKER_COUNT:-4}"
 TRADE_WORKER_COUNT="${PM_TRADE_WORKER_COUNT:-4}"
 NEW_MARKET_BACKFILL_SECONDS="${PM_NEW_MARKET_BACKFILL_SECONDS:-0}"
+INCLUDE_CLOSED_MARKETS="${PM_INCLUDE_CLOSED_MARKETS:-1}"
+INCLUDE_ARCHIVED_MARKETS="${PM_INCLUDE_ARCHIVED_MARKETS:-1}"
 FREEZE_TRACKED_MARKETS="${PM_FREEZE_TRACKED_MARKETS:-1}"
 FULL_TRADES_FOR_TRACKED_MARKETS="${PM_FULL_TRADES_FOR_TRACKED_MARKETS:-1}"
 COLLECT_MIDPOINTS="${PM_COLLECT_MIDPOINTS:-0}"
 COLLECT_SPREADS="${PM_COLLECT_SPREADS:-0}"
+HTTP_MAX_RETRIES="${PM_HTTP_MAX_RETRIES:-5}"
+HTTP_BACKOFF_BASE_SECONDS="${PM_HTTP_BACKOFF_BASE_SECONDS:-0.5}"
+HTTP_MAX_BACKOFF_SECONDS="${PM_HTTP_MAX_BACKOFF_SECONDS:-8}"
+RAW_SOURCES="${PM_RAW_SOURCES:-ws_market}"
 LOG_FILE="${PM_LOG_FILE:-run_primary_12h_rich.log}"
 PID_FILE="${PM_PID_FILE:-.primary.pid}"
 KILL_EXISTING="${PM_KILL_EXISTING:-1}"
@@ -94,11 +100,25 @@ if [[ "${COLLECT_SPREADS}" == "1" ]]; then
   collect_spreads_flag+=(--collect-spreads)
 fi
 
+include_closed_markets_flag=()
+if [[ "${INCLUDE_CLOSED_MARKETS}" == "1" ]]; then
+  include_closed_markets_flag+=(--include-closed-markets)
+fi
+
+include_archived_markets_flag=()
+if [[ "${INCLUDE_ARCHIVED_MARKETS}" == "1" ]]; then
+  include_archived_markets_flag+=(--include-archived-markets)
+fi
+
 nohup python -m polymarket_collector \
   --data-root "${DATA_ROOT}" \
   --bucket-seconds "${BUCKET_SECONDS}" \
   --writer-node-id "${WRITER_NODE_ID}" \
   --clob-driver "${CLOB_DRIVER}" \
+  --http-max-retries "${HTTP_MAX_RETRIES}" \
+  --http-backoff-base-seconds "${HTTP_BACKOFF_BASE_SECONDS}" \
+  --http-max-backoff-seconds "${HTTP_MAX_BACKOFF_SECONDS}" \
+  --raw-sources "${RAW_SOURCES}" \
   run-primary \
   --node-id "${NODE_ID}" \
   --interval-seconds "${INTERVAL_SECONDS}" \
@@ -127,6 +147,8 @@ nohup python -m polymarket_collector \
   --rest-worker-count "${REST_WORKER_COUNT}" \
   --trade-worker-count "${TRADE_WORKER_COUNT}" \
   --new-market-backfill-seconds "${NEW_MARKET_BACKFILL_SECONDS}" \
+  "${include_closed_markets_flag[@]}" \
+  "${include_archived_markets_flag[@]}" \
   "${freeze_tracked_markets_flag[@]}" \
   "${full_trades_for_tracked_markets_flag[@]}" \
   "${collect_midpoints_flag[@]}" \

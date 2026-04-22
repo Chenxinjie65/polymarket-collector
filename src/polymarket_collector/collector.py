@@ -56,17 +56,33 @@ class CollectorConfig:
     clob_driver: str = "raw"  # supported: raw, pyclob
     bucket_seconds: int = 3600
     writer_node_id: str = "standalone"
+    http_max_retries: int = 5
+    http_backoff_base_seconds: float = 0.5
+    http_max_backoff_seconds: float = 8.0
+    raw_sources: tuple[str, ...] | None = None
+    write_gamma_markets_raw: bool = False
+    write_gamma_events_raw: bool = False
 
 
 class JsonlGzWriter:
     _global_write_lock = threading.Lock()
 
-    def __init__(self, root: Path, *, bucket_seconds: int, node_id: str) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        bucket_seconds: int,
+        node_id: str,
+        raw_sources: tuple[str, ...] | None = None,
+    ) -> None:
         self.root = root
         self.bucket_seconds = max(1, int(bucket_seconds))
         self.node_id = _safe_node_id(node_id)
+        self.raw_sources = set(raw_sources) if raw_sources else None
 
     def write(self, source: str, records: list[dict[str, Any]]) -> Path | None:
+        if self.raw_sources is not None and source not in self.raw_sources:
+            return None
         if not records:
             return None
 
@@ -107,10 +123,63 @@ class PolymarketCollector:
             config.data_root,
             bucket_seconds=config.bucket_seconds,
             node_id=config.writer_node_id,
+            raw_sources=config.raw_sources,
         )
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": config.user_agent})
         self._pyclob = _build_pyclob_client(config.clob_driver)
+
+    def _request_with_retries(
+        self,
+        *,
+        method: str,
+        url: str,
+        params: dict[str, Any] | None = None,
+        json_payload: dict[str, Any] | list[dict[str, Any]] | None = None,
+    ) -> requests.Response:
+        retries = max(0, int(self.config.http_max_retries))
+        max_attempts = retries + 1
+        transient_statuses = {429, 500, 502, 503, 504}
+
+        for attempt in range(max_attempts):
+            try:
+                if method == "GET":
+                    response = self.session.get(
+                        url,
+                        params=params,
+                        timeout=self.config.timeout_seconds,
+                    )
+                elif method == "POST":
+                    response = self.session.post(
+                        url,
+                        json=json_payload,
+                        timeout=self.config.timeout_seconds,
+                    )
+                else:  # pragma: no cover - defensive branch
+                    raise ValueError(f"unsupported method: {method}")
+            except (requests.Timeout, requests.ConnectionError) as exc:
+                if attempt >= retries:
+                    raise
+                self._sleep_before_retry(attempt=attempt, response=None)
+                continue
+
+            if response.status_code in transient_statuses and attempt < retries:
+                self._sleep_before_retry(attempt=attempt, response=response)
+                continue
+            return response
+
+        raise RuntimeError("unreachable retry loop state")
+
+    def _sleep_before_retry(self, *, attempt: int, response: requests.Response | None) -> None:
+        retry_after = _parse_retry_after_seconds(response)
+        if retry_after is not None:
+            time.sleep(min(retry_after, max(0.0, self.config.http_max_backoff_seconds)))
+            return
+
+        base = max(0.01, float(self.config.http_backoff_base_seconds))
+        cap = max(base, float(self.config.http_max_backoff_seconds))
+        backoff = min(cap, base * (2**attempt))
+        time.sleep(backoff)
 
     def discover_markets(
         self,
@@ -120,20 +189,22 @@ class PolymarketCollector:
         closed: bool = False,
         archived: bool = False,
     ) -> tuple[list[dict[str, Any]], Path | None]:
-        response = self.session.get(
-            f"{GAMMA_API}/markets",
+        response = self._request_with_retries(
+            method="GET",
+            url=f"{GAMMA_API}/markets",
             params={
                 "limit": limit,
                 "active": str(active).lower(),
                 "closed": str(closed).lower(),
                 "archived": str(archived).lower(),
             },
-            timeout=self.config.timeout_seconds,
         )
         response.raise_for_status()
         markets = response.json()
-        wrapped = [self._wrap_record("gamma_markets", market) for market in markets]
-        path = self.writer.write("gamma_markets", wrapped)
+        path = None
+        if self.config.write_gamma_markets_raw:
+            wrapped = [self._wrap_record("gamma_markets", market) for market in markets]
+            path = self.writer.write("gamma_markets", wrapped)
         return markets, path
 
     def discover_markets_all_pages(
@@ -151,8 +222,9 @@ class PolymarketCollector:
         page_count = 0
 
         while page_count < max_pages:
-            response = self.session.get(
-                f"{GAMMA_API}/markets",
+            response = self._request_with_retries(
+                method="GET",
+                url=f"{GAMMA_API}/markets",
                 params={
                     "limit": page_limit,
                     "offset": offset,
@@ -160,7 +232,6 @@ class PolymarketCollector:
                     "closed": str(closed).lower(),
                     "archived": str(archived).lower(),
                 },
-                timeout=self.config.timeout_seconds,
             )
             response.raise_for_status()
             page = response.json()
@@ -183,8 +254,9 @@ class PolymarketCollector:
                 break
             offset += page_limit
 
-        wrapped = [self._wrap_record("gamma_markets", market) for market in markets]
-        self.writer.write("gamma_markets", wrapped)
+        if self.config.write_gamma_markets_raw:
+            wrapped = [self._wrap_record("gamma_markets", market) for market in markets]
+            self.writer.write("gamma_markets", wrapped)
         return markets
 
     def discover_events(
@@ -195,20 +267,22 @@ class PolymarketCollector:
         closed: bool = False,
         archived: bool = False,
     ) -> tuple[list[dict[str, Any]], Path | None]:
-        response = self.session.get(
-            f"{GAMMA_API}/events",
+        response = self._request_with_retries(
+            method="GET",
+            url=f"{GAMMA_API}/events",
             params={
                 "limit": limit,
                 "active": str(active).lower(),
                 "closed": str(closed).lower(),
                 "archived": str(archived).lower(),
             },
-            timeout=self.config.timeout_seconds,
         )
         response.raise_for_status()
         events = response.json()
-        wrapped = [self._wrap_record("gamma_events", event) for event in events]
-        path = self.writer.write("gamma_events", wrapped)
+        path = None
+        if self.config.write_gamma_events_raw:
+            wrapped = [self._wrap_record("gamma_events", event) for event in events]
+            path = self.writer.write("gamma_events", wrapped)
         return events, path
 
     def discover_events_all_pages(
@@ -226,8 +300,9 @@ class PolymarketCollector:
         page_count = 0
 
         while page_count < max_pages:
-            response = self.session.get(
-                f"{GAMMA_API}/events",
+            response = self._request_with_retries(
+                method="GET",
+                url=f"{GAMMA_API}/events",
                 params={
                     "limit": page_limit,
                     "offset": offset,
@@ -235,7 +310,6 @@ class PolymarketCollector:
                     "closed": str(closed).lower(),
                     "archived": str(archived).lower(),
                 },
-                timeout=self.config.timeout_seconds,
             )
             response.raise_for_status()
             page = response.json()
@@ -258,8 +332,9 @@ class PolymarketCollector:
                 break
             offset += page_limit
 
-        wrapped = [self._wrap_record("gamma_events", event) for event in events]
-        self.writer.write("gamma_events", wrapped)
+        if self.config.write_gamma_events_raw:
+            wrapped = [self._wrap_record("gamma_events", event) for event in events]
+            self.writer.write("gamma_events", wrapped)
         return events
 
     def fetch_trades(
@@ -304,10 +379,10 @@ class PolymarketCollector:
             if market_batch:
                 params["market"] = ",".join(market_batch)
 
-            response = self.session.get(
-                f"{DATA_API}/trades",
+            response = self._request_with_retries(
+                method="GET",
+                url=f"{DATA_API}/trades",
                 params=params,
-                timeout=self.config.timeout_seconds,
             )
             response.raise_for_status()
             trades.extend(response.json())
@@ -378,10 +453,10 @@ class PolymarketCollector:
                 continue
 
             payload = [{"token_id": token_id} for token_id in token_batch]
-            response = self.session.post(
-                f"{CLOB_API}/books",
-                json=payload,
-                timeout=self.config.timeout_seconds,
+            response = self._request_with_retries(
+                method="POST",
+                url=f"{CLOB_API}/books",
+                json_payload=payload,
             )
             response.raise_for_status()
             books.extend(response.json())
@@ -394,10 +469,10 @@ class PolymarketCollector:
         midpoints: dict[str, Any] = {}
         for token_batch in _chunk_values(values=token_ids, max_batch_size=MAX_CLOB_MIDPOINTS_BATCH_SIZE):
             payload = [{"token_id": token_id} for token_id in token_batch]
-            response = self.session.post(
-                f"{CLOB_API}/midpoints",
-                json=payload,
-                timeout=self.config.timeout_seconds,
+            response = self._request_with_retries(
+                method="POST",
+                url=f"{CLOB_API}/midpoints",
+                json_payload=payload,
             )
             response.raise_for_status()
             midpoints.update(response.json())
@@ -410,10 +485,10 @@ class PolymarketCollector:
         spreads: dict[str, Any] = {}
         for token_batch in _chunk_values(values=token_ids, max_batch_size=MAX_CLOB_SPREADS_BATCH_SIZE):
             payload = [{"token_id": token_id} for token_id in token_batch]
-            response = self.session.post(
-                f"{CLOB_API}/spreads",
-                json=payload,
-                timeout=self.config.timeout_seconds,
+            response = self._request_with_retries(
+                method="POST",
+                url=f"{CLOB_API}/spreads",
+                json_payload=payload,
             )
             response.raise_for_status()
             spreads.update(response.json())
@@ -470,10 +545,10 @@ class PolymarketCollector:
             fidelity=fidelity,
         )
 
-        response = self.session.post(
-            f"{CLOB_API}/batch-prices-history",
-            json=payload,
-            timeout=self.config.timeout_seconds,
+        response = self._request_with_retries(
+            method="POST",
+            url=f"{CLOB_API}/batch-prices-history",
+            json_payload=payload,
         )
         try:
             response.raise_for_status()
@@ -481,10 +556,10 @@ class PolymarketCollector:
             if _is_absolute_history_request(start_ts=start_ts, end_ts=end_ts) and "interval" in payload:
                 retry_payload = dict(payload)
                 retry_payload.pop("interval", None)
-                retry_response = self.session.post(
-                    f"{CLOB_API}/batch-prices-history",
-                    json=retry_payload,
-                    timeout=self.config.timeout_seconds,
+                retry_response = self._request_with_retries(
+                    method="POST",
+                    url=f"{CLOB_API}/batch-prices-history",
+                    json_payload=retry_payload,
                 )
                 try:
                     retry_response.raise_for_status()
@@ -540,10 +615,10 @@ class PolymarketCollector:
             params: dict[str, Any] = {}
             if market_batch:
                 params["market"] = market_batch
-            response = self.session.get(
-                f"{DATA_API}/oi",
+            response = self._request_with_retries(
+                method="GET",
+                url=f"{DATA_API}/oi",
                 params=params or None,
-                timeout=self.config.timeout_seconds,
             )
             response.raise_for_status()
             values.extend(response.json())
@@ -566,10 +641,10 @@ class PolymarketCollector:
             params: dict[str, Any] = {}
             if market_batch:
                 params["market"] = market_batch
-            response = self.session.get(
-                f"{DATA_API}/holders",
+            response = self._request_with_retries(
+                method="GET",
+                url=f"{DATA_API}/holders",
                 params=params or None,
-                timeout=self.config.timeout_seconds,
             )
             response.raise_for_status()
             holders.extend(response.json())
@@ -973,6 +1048,21 @@ def _merge_dict_results(left: dict[str, Any], right: dict[str, Any]) -> dict[str
             continue
         merged[key] = value
     return merged
+
+
+def _parse_retry_after_seconds(response: requests.Response | None) -> float | None:
+    if response is None:
+        return None
+    raw = response.headers.get("Retry-After")
+    if raw is None:
+        return None
+    try:
+        value = float(raw.strip())
+    except ValueError:
+        return None
+    if value < 0:
+        return None
+    return value
 
 
 def _build_pyclob_client(clob_driver: str):

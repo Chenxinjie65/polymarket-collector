@@ -61,6 +61,8 @@ class _BackgroundWsCollector:
         self._selection_lock = threading.Lock()
         self._worker_errors: list[str | None] = [None for _ in range(self.worker_count)]
         self._error_lock = threading.Lock()
+        self._worker_message_counts: list[int] = [0 for _ in range(self.worker_count)]
+        self._stats_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._threads = [
             threading.Thread(
@@ -100,6 +102,12 @@ class _BackgroundWsCollector:
         with self._error_lock:
             self._worker_errors[worker_index] = value
 
+    def consume_stats(self) -> dict[str, int]:
+        with self._stats_lock:
+            total_messages = sum(self._worker_message_counts)
+            self._worker_message_counts = [0 for _ in range(self.worker_count)]
+        return {"messages_in_cycle": total_messages}
+
     def _run_worker(self, worker_index: int) -> None:
         collector = PolymarketCollector(self.collector_config)
         while not self._stop_event.is_set():
@@ -118,7 +126,7 @@ class _BackgroundWsCollector:
                 continue
 
             try:
-                collector.stream_market(
+                message_count = collector.stream_market(
                     asset_ids=asset_ids,
                     duration_seconds=self.ws_duration_seconds,
                     flush_every_messages=self.flush_every_messages,
@@ -127,6 +135,8 @@ class _BackgroundWsCollector:
                     on_new_market=lambda event: self._handle_event(event=event, add=True),
                     on_market_resolved=lambda event: self._handle_event(event=event, add=False),
                 )
+                with self._stats_lock:
+                    self._worker_message_counts[worker_index] += max(0, int(message_count))
                 self._set_worker_error(worker_index, None)
             except Exception as exc:  # noqa: BLE001
                 self._set_worker_error(worker_index, f"background_stream_market_failed[{worker_index}]:{exc}")
@@ -175,6 +185,8 @@ def run_primary_loop(
     trade_worker_count: int,
     discover_all_pages: bool,
     page_limit: int,
+    include_closed_markets: bool,
+    include_archived_markets: bool,
     new_market_backfill_seconds: int,
     freeze_tracked_markets: bool,
     full_trades_for_tracked_markets: bool,
@@ -198,15 +210,19 @@ def run_primary_loop(
         subscribe_batch_size=ws_subscribe_batch_size,
     )
     ws_collector.start()
+    previous_ws_raw_bytes = _source_raw_size_bytes(data_root=data_root, source="ws_market")
     try:
         while True:
             cycle_started = time.monotonic()
+            cycle_ts = datetime.now(UTC).isoformat()
             try:
                 markets = _discover_markets_for_cycle(
                     collector=collector,
                     discover_all_pages=discover_all_pages,
                     market_limit=market_limit,
                     page_limit=page_limit,
+                    include_closed_markets=include_closed_markets,
+                    include_archived_markets=include_archived_markets,
                 )
                 _write_latest_markets(data_root, markets)
                 tracked_selection = _resolve_tracked_market_selection(
@@ -261,10 +277,41 @@ def run_primary_loop(
                 ws_error = ws_collector.last_error()
                 if ws_error:
                     collection_warnings.append(ws_error)
+                ws_stats = ws_collector.consume_stats()
+                cycle_elapsed_seconds = max(0.0, time.monotonic() - cycle_started)
+                current_ws_raw_bytes = _source_raw_size_bytes(data_root=data_root, source="ws_market")
+                ws_raw_growth_bytes = max(0, current_ws_raw_bytes - previous_ws_raw_bytes)
+                previous_ws_raw_bytes = current_ws_raw_bytes
+                if ws_stats["messages_in_cycle"] <= 0 and ws_raw_growth_bytes <= 0:
+                    collection_warnings.append("ws_market_no_growth_in_cycle")
 
                 _save_universe_state(data_root, universe_state)
                 _save_tracked_market_selection(data_root, persisted_tracked_selection)
                 _save_trade_frontier_state(data_root, trade_frontier)
+                quality_payload = {
+                    "role": "primary",
+                    "node_id": node_id,
+                    "cycle_ts": cycle_ts,
+                    "cycle_elapsed_seconds": round(cycle_elapsed_seconds, 3),
+                    "markets_count": len(markets),
+                    "events_count": event_count,
+                    "ws_messages_in_cycle": ws_stats["messages_in_cycle"],
+                    "ws_raw_growth_bytes": ws_raw_growth_bytes,
+                    "ws_raw_total_bytes": current_ws_raw_bytes,
+                    "collection_warning_count": len(collection_warnings),
+                    "bootstrap_warning_count": len(cycle_state["bootstrap_warnings"]),
+                }
+                report_path = _write_runtime_quality_report(data_root=data_root, payload=quality_payload)
+                if collection_warnings:
+                    _append_runtime_alert(
+                        data_root=data_root,
+                        payload={
+                            "ts": cycle_ts,
+                            "role": "primary",
+                            "node_id": node_id,
+                            "collection_warnings": collection_warnings,
+                        },
+                    )
 
                 write_heartbeat(
                     data_root=data_root,
@@ -273,7 +320,7 @@ def run_primary_loop(
                     status="ok",
                     extra={
                         "mode": "collecting",
-                        "cycle_ts": datetime.now(UTC).isoformat(),
+                        "cycle_ts": cycle_ts,
                         "markets_count": len(markets),
                         "events_count": event_count,
                         "condition_ids_count": len(universe_state.condition_ids),
@@ -292,6 +339,9 @@ def run_primary_loop(
                         "tracked_added_asset_ids_count": len(persisted_tracked_selection.added_asset_ids),
                         "tracked_removed_asset_ids_count": len(persisted_tracked_selection.removed_asset_ids),
                         "trade_frontier_condition_count": len(trade_frontier),
+                        "ws_messages_in_cycle": ws_stats["messages_in_cycle"],
+                        "ws_raw_growth_bytes": ws_raw_growth_bytes,
+                        "quality_report_path": str(report_path),
                         "collection_warnings": collection_warnings,
                         "bootstrap_warnings": cycle_state["bootstrap_warnings"],
                     },
@@ -351,6 +401,8 @@ def run_backup_loop(
     trade_worker_count: int,
     discover_all_pages: bool,
     page_limit: int,
+    include_closed_markets: bool,
+    include_archived_markets: bool,
     new_market_backfill_seconds: int,
     freeze_tracked_markets: bool,
     full_trades_for_tracked_markets: bool,
@@ -364,9 +416,11 @@ def run_backup_loop(
     trade_frontier = _load_trade_frontier_state(data_root)
     start = time.monotonic()
     ws_collector: _BackgroundWsCollector | None = None
+    previous_ws_raw_bytes = _source_raw_size_bytes(data_root=data_root, source="ws_market")
     try:
         while True:
             cycle_started = time.monotonic()
+            cycle_ts = datetime.now(UTC).isoformat()
             try:
                 decision = evaluate_failover(
                     data_root=data_root,
@@ -391,6 +445,8 @@ def run_backup_loop(
                         discover_all_pages=discover_all_pages,
                         market_limit=market_limit,
                         page_limit=page_limit,
+                        include_closed_markets=include_closed_markets,
+                        include_archived_markets=include_archived_markets,
                     )
                     _write_latest_markets(data_root, markets)
                     tracked_selection = _resolve_tracked_market_selection(
@@ -445,10 +501,41 @@ def run_backup_loop(
                     ws_error = ws_collector.last_error()
                     if ws_error:
                         collection_warnings.append(ws_error)
+                    ws_stats = ws_collector.consume_stats()
+                    cycle_elapsed_seconds = max(0.0, time.monotonic() - cycle_started)
+                    current_ws_raw_bytes = _source_raw_size_bytes(data_root=data_root, source="ws_market")
+                    ws_raw_growth_bytes = max(0, current_ws_raw_bytes - previous_ws_raw_bytes)
+                    previous_ws_raw_bytes = current_ws_raw_bytes
+                    if ws_stats["messages_in_cycle"] <= 0 and ws_raw_growth_bytes <= 0:
+                        collection_warnings.append("ws_market_no_growth_in_cycle")
 
                     _save_universe_state(data_root, universe_state)
                     _save_tracked_market_selection(data_root, persisted_tracked_selection)
                     _save_trade_frontier_state(data_root, trade_frontier)
+                    quality_payload = {
+                        "role": "backup_active",
+                        "node_id": node_id,
+                        "cycle_ts": cycle_ts,
+                        "cycle_elapsed_seconds": round(cycle_elapsed_seconds, 3),
+                        "markets_count": len(markets),
+                        "events_count": event_count,
+                        "ws_messages_in_cycle": ws_stats["messages_in_cycle"],
+                        "ws_raw_growth_bytes": ws_raw_growth_bytes,
+                        "ws_raw_total_bytes": current_ws_raw_bytes,
+                        "collection_warning_count": len(collection_warnings),
+                        "bootstrap_warning_count": len(cycle_state["bootstrap_warnings"]),
+                    }
+                    report_path = _write_runtime_quality_report(data_root=data_root, payload=quality_payload)
+                    if collection_warnings:
+                        _append_runtime_alert(
+                            data_root=data_root,
+                            payload={
+                                "ts": cycle_ts,
+                                "role": "backup",
+                                "node_id": node_id,
+                                "collection_warnings": collection_warnings,
+                            },
+                        )
 
                     write_heartbeat(
                         data_root=data_root,
@@ -458,7 +545,7 @@ def run_backup_loop(
                         extra={
                             "mode": "active",
                             "failover_decision": decision,
-                            "cycle_ts": datetime.now(UTC).isoformat(),
+                            "cycle_ts": cycle_ts,
                             "markets_count": len(markets),
                             "events_count": event_count,
                             "condition_ids_count": len(universe_state.condition_ids),
@@ -477,6 +564,9 @@ def run_backup_loop(
                             "tracked_added_asset_ids_count": len(persisted_tracked_selection.added_asset_ids),
                             "tracked_removed_asset_ids_count": len(persisted_tracked_selection.removed_asset_ids),
                             "trade_frontier_condition_count": len(trade_frontier),
+                            "ws_messages_in_cycle": ws_stats["messages_in_cycle"],
+                            "ws_raw_growth_bytes": ws_raw_growth_bytes,
+                            "quality_report_path": str(report_path),
                             "collection_warnings": collection_warnings,
                             "bootstrap_warnings": cycle_state["bootstrap_warnings"],
                         },
@@ -493,7 +583,7 @@ def run_backup_loop(
                         extra={
                             "mode": "standby",
                             "failover_decision": decision,
-                            "cycle_ts": datetime.now(UTC).isoformat(),
+                            "cycle_ts": cycle_ts,
                         },
                     )
             except Exception as exc:  # noqa: BLE001
@@ -541,11 +631,74 @@ def _discover_markets_for_cycle(
     discover_all_pages: bool,
     market_limit: int,
     page_limit: int,
+    include_closed_markets: bool,
+    include_archived_markets: bool,
 ) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+
+    def _append(items: list[dict[str, Any]]) -> None:
+        for item in items:
+            market_id = item.get("id")
+            key = str(market_id) if market_id is not None else json.dumps(item, ensure_ascii=True, sort_keys=True)
+            if key in seen_ids:
+                continue
+            seen_ids.add(key)
+            merged.append(item)
+
     if discover_all_pages:
-        return collector.discover_markets_all_pages(page_limit=page_limit)
-    markets, _ = collector.discover_markets(limit=market_limit)
-    return markets
+        _append(
+            collector.discover_markets_all_pages(
+                page_limit=page_limit,
+                active=True,
+                closed=False,
+                archived=False,
+            )
+        )
+        if include_closed_markets:
+            _append(
+                collector.discover_markets_all_pages(
+                    page_limit=page_limit,
+                    active=False,
+                    closed=True,
+                    archived=False,
+                )
+            )
+        if include_archived_markets:
+            _append(
+                collector.discover_markets_all_pages(
+                    page_limit=page_limit,
+                    active=False,
+                    closed=False,
+                    archived=True,
+                )
+            )
+        return merged
+
+    active_markets, _ = collector.discover_markets(
+        limit=market_limit,
+        active=True,
+        closed=False,
+        archived=False,
+    )
+    _append(active_markets)
+    if include_closed_markets:
+        closed_markets, _ = collector.discover_markets(
+            limit=market_limit,
+            active=False,
+            closed=True,
+            archived=False,
+        )
+        _append(closed_markets)
+    if include_archived_markets:
+        archived_markets, _ = collector.discover_markets(
+            limit=market_limit,
+            active=False,
+            closed=False,
+            archived=True,
+        )
+        _append(archived_markets)
+    return merged
 
 
 def _discover_events_for_cycle(
@@ -1270,4 +1423,37 @@ def _save_universe_state(data_root: Path, state: UniverseState) -> Path:
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     tmp_path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
     tmp_path.replace(path)
+    return path
+
+
+def _source_raw_size_bytes(*, data_root: Path, source: str) -> int:
+    source_root = data_root / "raw" / f"source={source}"
+    if not source_root.exists():
+        return 0
+    total = 0
+    for path in source_root.rglob("*.jsonl.gz"):
+        if path.is_file():
+            total += path.stat().st_size
+    return total
+
+
+def _write_runtime_quality_report(*, data_root: Path, payload: dict[str, Any]) -> Path:
+    reports_dir = data_root / "state" / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(UTC)
+    path = reports_dir / f"runtime_quality_{ts:%Y%m%dT%H%M%S}.json"
+    latest_path = reports_dir / "runtime_quality_latest.json"
+    text = json.dumps(payload, ensure_ascii=True, indent=2)
+    path.write_text(text, encoding="utf-8")
+    latest_path.write_text(text, encoding="utf-8")
+    return path
+
+
+def _append_runtime_alert(*, data_root: Path, payload: dict[str, Any]) -> Path:
+    reports_dir = data_root / "state" / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    path = reports_dir / "runtime_alerts.jsonl"
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=True, separators=(",", ":")))
+        handle.write("\n")
     return path

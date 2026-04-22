@@ -33,6 +33,12 @@ def main() -> int:
             clob_driver=args.clob_driver,
             bucket_seconds=args.bucket_seconds,
             writer_node_id=writer_node_id,
+            http_max_retries=args.http_max_retries,
+            http_backoff_base_seconds=args.http_backoff_base_seconds,
+            http_max_backoff_seconds=args.http_max_backoff_seconds,
+            raw_sources=_parse_raw_sources(args.raw_sources),
+            write_gamma_markets_raw=args.write_gamma_markets_raw,
+            write_gamma_events_raw=args.write_gamma_events_raw,
         )
     )
 
@@ -42,6 +48,19 @@ def main() -> int:
         print(f"fetched_markets={len(markets)}")
         if path:
             print(f"written={path}")
+        return 0
+
+    if args.command == "discover-markets-universe":
+        data_root = Path(args.data_root)
+        markets = _discover_markets_universe(
+            collector=collector,
+            page_limit=args.page_limit,
+            include_closed=args.include_closed,
+            include_archived=args.include_archived,
+        )
+        output_path = _write_latest_markets_universe(data_root, markets)
+        print(f"fetched_markets={len(markets)}")
+        print(f"written={output_path}")
         return 0
 
     if args.command == "discover-events":
@@ -272,6 +291,8 @@ def main() -> int:
             trade_worker_count=args.trade_worker_count,
             discover_all_pages=args.discover_all_pages,
             page_limit=args.page_limit,
+            include_closed_markets=args.include_closed_markets,
+            include_archived_markets=args.include_archived_markets,
             new_market_backfill_seconds=args.new_market_backfill_seconds,
             freeze_tracked_markets=args.freeze_tracked_markets,
             full_trades_for_tracked_markets=args.full_trades_for_tracked_markets,
@@ -314,6 +335,8 @@ def main() -> int:
             trade_worker_count=args.trade_worker_count,
             discover_all_pages=args.discover_all_pages,
             page_limit=args.page_limit,
+            include_closed_markets=args.include_closed_markets,
+            include_archived_markets=args.include_archived_markets,
             new_market_backfill_seconds=args.new_market_backfill_seconds,
             freeze_tracked_markets=args.freeze_tracked_markets,
             full_trades_for_tracked_markets=args.full_trades_for_tracked_markets,
@@ -349,11 +372,67 @@ def build_parser() -> argparse.ArgumentParser:
         default="raw",
         help="CLOB client implementation: raw HTTP or official py-clob-client",
     )
+    parser.add_argument(
+        "--http-max-retries",
+        type=int,
+        default=5,
+        help="Maximum retry count for transient HTTP errors (429/5xx, timeout, connection error)",
+    )
+    parser.add_argument(
+        "--http-backoff-base-seconds",
+        type=float,
+        default=0.5,
+        help="Base backoff in seconds for HTTP retries",
+    )
+    parser.add_argument(
+        "--http-max-backoff-seconds",
+        type=float,
+        default=8.0,
+        help="Maximum backoff in seconds for HTTP retries",
+    )
+    parser.add_argument(
+        "--raw-sources",
+        default="all",
+        help=(
+            "Comma-separated raw sources to persist (e.g. 'ws_market'). "
+            "Use 'all' to persist every raw source."
+        ),
+    )
+    parser.add_argument(
+        "--write-gamma-markets-raw",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Persist gamma_markets snapshots to raw jsonl.gz (disabled by default)",
+    )
+    parser.add_argument(
+        "--write-gamma-events-raw",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Persist gamma_events snapshots to raw jsonl.gz (disabled by default)",
+    )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     discover = subparsers.add_parser("discover-markets", help="Fetch active markets")
     discover.add_argument("--limit", type=int, default=50, help="Number of active markets to fetch")
+
+    discover_universe = subparsers.add_parser(
+        "discover-markets-universe",
+        help="Fetch all market statuses (active + optional closed/archived) with full-page scan",
+    )
+    discover_universe.add_argument("--page-limit", type=int, default=500, help="Gamma page size for each status sweep")
+    discover_universe.add_argument(
+        "--include-closed",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include closed markets in the universe sweep",
+    )
+    discover_universe.add_argument(
+        "--include-archived",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include archived markets in the universe sweep",
+    )
 
     events = subparsers.add_parser("discover-events", help="Fetch active events")
     events.add_argument("--limit", type=int, default=50, help="Number of active events to fetch")
@@ -585,8 +664,8 @@ def build_parser() -> argparse.ArgumentParser:
     primary.add_argument("--max-assets-for-ws", type=int, default=0, help="Max assets for WS stream; <=0 means all")
     primary.add_argument("--ws-duration-seconds", type=int, default=60, help="WS duration per cycle")
     primary.add_argument("--ws-worker-count", type=int, default=4, help="Number of background ws shard workers")
-    primary.add_argument("--ws-flush-every-messages", type=int, default=50, help="Flush ws records after N messages")
-    primary.add_argument("--ws-flush-every-seconds", type=int, default=5, help="Flush ws records after N seconds")
+    primary.add_argument("--ws-flush-every-messages", type=int, default=10, help="Flush ws records after N messages")
+    primary.add_argument("--ws-flush-every-seconds", type=int, default=1, help="Flush ws records after N seconds")
     primary.add_argument(
         "--ws-subscribe-batch-size",
         type=int,
@@ -603,9 +682,21 @@ def build_parser() -> argparse.ArgumentParser:
     primary.add_argument(
         "--discover-all-pages",
         action="store_true",
-        help="Scan all active market pages each cycle",
+        help="Scan market pages each cycle (active by default; closed/archived controlled by include flags)",
     )
     primary.add_argument("--page-limit", type=int, default=500, help="Gamma page size when scanning all pages")
+    primary.add_argument(
+        "--include-closed-markets",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Include closed markets in cycle discovery",
+    )
+    primary.add_argument(
+        "--include-archived-markets",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Include archived markets in cycle discovery",
+    )
     primary.add_argument(
         "--new-market-backfill-seconds",
         type=int,
@@ -720,8 +811,8 @@ def build_parser() -> argparse.ArgumentParser:
     backup.add_argument("--max-assets-for-ws", type=int, default=0, help="Max assets for WS stream; <=0 means all")
     backup.add_argument("--ws-duration-seconds", type=int, default=60, help="WS duration per active cycle")
     backup.add_argument("--ws-worker-count", type=int, default=4, help="Number of background ws shard workers")
-    backup.add_argument("--ws-flush-every-messages", type=int, default=50, help="Flush ws records after N messages")
-    backup.add_argument("--ws-flush-every-seconds", type=int, default=5, help="Flush ws records after N seconds")
+    backup.add_argument("--ws-flush-every-messages", type=int, default=10, help="Flush ws records after N messages")
+    backup.add_argument("--ws-flush-every-seconds", type=int, default=1, help="Flush ws records after N seconds")
     backup.add_argument(
         "--ws-subscribe-batch-size",
         type=int,
@@ -738,9 +829,21 @@ def build_parser() -> argparse.ArgumentParser:
     backup.add_argument(
         "--discover-all-pages",
         action="store_true",
-        help="Scan all active market pages when backup is active",
+        help="Scan market pages when backup is active (active by default; closed/archived controlled by include flags)",
     )
     backup.add_argument("--page-limit", type=int, default=500, help="Gamma page size when scanning all pages")
+    backup.add_argument(
+        "--include-closed-markets",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Include closed markets in cycle discovery when backup is active",
+    )
+    backup.add_argument(
+        "--include-archived-markets",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Include archived markets in cycle discovery when backup is active",
+    )
     backup.add_argument(
         "--new-market-backfill-seconds",
         type=int,
@@ -790,9 +893,66 @@ def _write_latest_markets(data_root: Path, markets: list[dict[str, Any]]) -> Pat
     return latest_path
 
 
+def _write_latest_markets_universe(data_root: Path, markets: list[dict[str, Any]]) -> Path:
+    data_root.mkdir(parents=True, exist_ok=True)
+    latest_path = data_root / "latest_markets_all.json"
+    latest_path.write_text(json.dumps(markets, ensure_ascii=True, indent=2), encoding="utf-8")
+    return latest_path
+
+
+def _discover_markets_universe(
+    *,
+    collector: PolymarketCollector,
+    page_limit: int,
+    include_closed: bool,
+    include_archived: bool,
+) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+
+    def _append(markets: list[dict[str, Any]]) -> None:
+        for item in markets:
+            market_id = item.get("id")
+            key = str(market_id) if market_id is not None else json.dumps(item, ensure_ascii=True, sort_keys=True)
+            if key in seen_ids:
+                continue
+            seen_ids.add(key)
+            merged.append(item)
+
+    _append(
+        collector.discover_markets_all_pages(
+            page_limit=page_limit,
+            active=True,
+            closed=False,
+            archived=False,
+        )
+    )
+    if include_closed:
+        _append(
+            collector.discover_markets_all_pages(
+                page_limit=page_limit,
+                active=False,
+                closed=True,
+                archived=False,
+            )
+        )
+    if include_archived:
+        _append(
+            collector.discover_markets_all_pages(
+                page_limit=page_limit,
+                active=False,
+                closed=False,
+                archived=True,
+            )
+        )
+    return merged
+
+
 def _load_markets_file(data_root: Path, markets_file: str) -> list[dict[str, Any]]:
     if markets_file == "latest":
         path = data_root / "latest_markets.json"
+    elif markets_file in {"latest-all", "latest_all"}:
+        path = data_root / "latest_markets_all.json"
     else:
         path = Path(markets_file)
 
@@ -806,6 +966,13 @@ def _load_markets_file(data_root: Path, markets_file: str) -> list[dict[str, Any
 
 def _parse_sources(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _parse_raw_sources(value: str) -> tuple[str, ...] | None:
+    sources = _parse_sources(value)
+    if not sources or any(item == "all" for item in sources):
+        return None
+    return tuple(sorted(set(sources)))
 
 
 def _parse_iso_datetime(value: str) -> datetime:
