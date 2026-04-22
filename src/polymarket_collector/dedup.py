@@ -149,7 +149,16 @@ def _extract_record_key(*, source: str, payload: Any) -> str:
 
     if source == "ws_market":
         if payload.get("event_type"):
-            fallback = (payload.get("event_type"), payload.get("market"), payload.get("timestamp"))
+            fallback = (
+                payload.get("event_type"),
+                payload.get("market") or payload.get("condition_id"),
+                payload.get("asset_id"),
+                payload.get("timestamp"),
+                payload.get("price"),
+                payload.get("size"),
+                payload.get("best_bid"),
+                payload.get("best_ask"),
+            )
             return "ws_event:" + "|".join(_safe_part(v) for v in fallback)
         return "ws_payload:" + _hash_payload(payload)
 
@@ -163,4 +172,3 @@ def _hash_payload(value: Any) -> str:
 
 def _safe_part(value: Any) -> str:
     return "" if value is None else str(value)
-

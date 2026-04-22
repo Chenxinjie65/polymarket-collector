@@ -44,33 +44,40 @@ def backfill_raw_partitions(
     while cursor <= end_hour:
         for source in sources:
             stats.partitions_scanned += 1
-            src_dir = _partition_dir(source_root, source, cursor)
-            dst_dir = _partition_dir(target_root, source, cursor)
-
-            if not src_dir.exists():
+            src_dirs = _partition_dirs(source_root, source, cursor)
+            if not src_dirs:
                 stats.files_missing_on_source += 1
                 continue
 
-            files = sorted(src_dir.glob("*.jsonl.gz"))
-            if not files:
-                stats.files_missing_on_source += 1
-                continue
-
-            if not dry_run:
-                dst_dir.mkdir(parents=True, exist_ok=True)
-
-            for src_file in files:
-                dst_file = dst_dir / src_file.name
-                if dst_file.exists():
-                    stats.files_skipped_existing += 1
+            found_files = False
+            for src_dir in src_dirs:
+                files = sorted(src_dir.glob("*.jsonl.gz"))
+                if not files:
                     continue
-                if dry_run:
+                found_files = True
+                dst_dir = _target_partition_dir(
+                    source_root=source_root,
+                    target_root=target_root,
+                    src_dir=src_dir,
+                )
+                if not dry_run:
+                    dst_dir.mkdir(parents=True, exist_ok=True)
+
+                for src_file in files:
+                    dst_file = dst_dir / src_file.name
+                    if dst_file.exists():
+                        stats.files_skipped_existing += 1
+                        continue
+                    if dry_run:
+                        stats.files_copied += 1
+                        stats.bytes_copied += src_file.stat().st_size
+                        continue
+                    shutil.copy2(src_file, dst_file)
                     stats.files_copied += 1
-                    stats.bytes_copied += src_file.stat().st_size
-                    continue
-                shutil.copy2(src_file, dst_file)
-                stats.files_copied += 1
-                stats.bytes_copied += dst_file.stat().st_size
+                    stats.bytes_copied += dst_file.stat().st_size
+
+            if not found_files:
+                stats.files_missing_on_source += 1
 
         cursor += timedelta(hours=1)
 
@@ -87,7 +94,22 @@ def _partition_dir(root: Path, source: str, hour: datetime) -> Path:
     )
 
 
+def _partition_dirs(root: Path, source: str, hour: datetime) -> list[Path]:
+    base = root / "raw" / f"source={source}"
+    if not base.exists():
+        return []
+    if source != "ws_market":
+        path = _partition_dir(root, source, hour)
+        return [path] if path.exists() else []
+    pattern = f"**/dt={hour:%Y-%m-%d}/hour={hour:%H}"
+    return sorted(path for path in base.glob(pattern) if path.is_dir())
+
+
+def _target_partition_dir(*, source_root: Path, target_root: Path, src_dir: Path) -> Path:
+    relative = src_dir.relative_to(source_root / "raw")
+    return target_root / "raw" / relative
+
+
 def _to_hour_floor(value: datetime) -> datetime:
     value = value.astimezone(UTC)
     return value.replace(minute=0, second=0, microsecond=0)
-

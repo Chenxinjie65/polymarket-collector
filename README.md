@@ -275,7 +275,7 @@ du -sb data/raw
 
 `du -sb` 会持续增长；`du -sh` 可能因单位取整短时间不变化，属于正常现象。
 
-在当前实现中，`ws_market` 会优先开始增长；即使 `trades` 等全量 REST 任务仍在运行，也应能看到 `data/raw/source=ws_market` 持续写入。
+在当前实现中，`ws_market` 会优先开始增长；即使 `trades` 等全量 REST 任务仍在运行，也应能看到 `data/raw/source=ws_market/market=.../asset=...` 持续写入。
 
 ## 数据布局
 
@@ -283,6 +283,7 @@ du -sb data/raw
 
 ```text
 data/raw/source=<source>/dt=YYYY-MM-DD/hour=HH/bucket_start=YYYYMMDDTHHMMSSZ_node=<node>.jsonl.gz
+data/raw/source=ws_market/market=<market>/asset=<asset>/dt=YYYY-MM-DD/hour=HH/bucket_start=YYYYMMDDTHHMMSSZ_node=<node>.jsonl.gz
 ```
 
 运行态状态文件：
@@ -323,7 +324,7 @@ ws_market
 - `run-primary` / `run-backup` 的 `ws_market` 为后台 worker 模式；默认 `ws-worker-count=4`。
 - `books` / `oi` / `holders` / `history` 默认通过 `rest-worker-count=4` 并发执行，且每个任务使用独立 collector。
 - `trades` 默认通过 `trade-worker-count=4` 分片并发执行；每个 batch 完成后会立即更新 `trade_frontier.json`。
-- 每个 WS worker 都会按 `flush_every_messages=10` 或 `flush_every_seconds=1` 落盘；文件仍按小时桶追加，不会每次 flush 新建文件。
+- 每个 WS worker 都会按 `flush_every_messages=10` 或 `flush_every_seconds=1` 落盘；`ws_market` 会先按 `market/asset` 拆分，再按小时桶追加，不会每次 flush 新建文件。
 - HTTP 请求默认启用重试/退避（429/5xx、超时、连接失败），并支持 `Retry-After`。
 - `--include-closed-markets` / `--include-archived-markets` 可把非 active 市场纳入主循环发现范围。
 - `ws_market` 连接内会在收到 `new_market` 时立即追加订阅新市场资产，在收到 `market_resolved` 时立即取消该市场资产订阅；状态会回写到 `tracked_market_selection.json`。

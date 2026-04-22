@@ -85,6 +85,8 @@ class JsonlGzWriter:
             return None
         if not records:
             return None
+        if source == "ws_market":
+            return self._write_ws_market_records(records)
 
         bucket_start = self._bucket_start(records[0])
         directory = (
@@ -105,7 +107,50 @@ class JsonlGzWriter:
 
         return path
 
+    def _write_ws_market_records(self, records: list[dict[str, Any]]) -> Path | None:
+        grouped_records: dict[Path, list[dict[str, Any]]] = {}
+        for record in records:
+            for scoped_record in _iter_ws_market_storage_records(record):
+                payload = scoped_record.get("payload")
+                market = "unknown"
+                asset_id = "unknown"
+                if isinstance(payload, dict):
+                    market = _safe_path_part(payload.get("market") or payload.get("condition_id"))
+                    asset_id = _safe_path_part(payload.get("asset_id"))
+                bucket_start = self._bucket_start(scoped_record)
+                path = (
+                    self.root
+                    / "raw"
+                    / "source=ws_market"
+                    / f"market={market}"
+                    / f"asset={asset_id}"
+                    / f"dt={bucket_start:%Y-%m-%d}"
+                    / f"hour={bucket_start:%H}"
+                    / f"bucket_start={bucket_start:%Y%m%dT%H%M%SZ}_node={self.node_id}.jsonl.gz"
+                )
+                grouped_records.setdefault(path, []).append(scoped_record)
+
+        if not grouped_records:
+            return None
+
+        with self._global_write_lock:
+            for path, grouped in grouped_records.items():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with gzip.open(path, "at", encoding="utf-8") as handle:
+                    for record in grouped:
+                        handle.write(json.dumps(record, ensure_ascii=True, separators=(",", ":")))
+                        handle.write("\n")
+
+        return next(reversed(grouped_records))
+
     def _bucket_start(self, record: dict[str, Any]) -> datetime:
+        payload = record.get("payload")
+        if isinstance(payload, dict):
+            event_dt = _coerce_event_datetime(payload.get("timestamp"))
+            if event_dt is not None:
+                epoch = int(event_dt.timestamp())
+                bucket_epoch = (epoch // self.bucket_seconds) * self.bucket_seconds
+                return datetime.fromtimestamp(bucket_epoch, tz=UTC)
         ts_value = record.get("ts_ingest")
         if isinstance(ts_value, str):
             dt = _parse_iso_datetime(ts_value)
@@ -857,6 +902,119 @@ def _extract_ws_assets_ids(event: dict[str, Any]) -> list[str]:
                 values.append(change_asset_id)
         return list(dict.fromkeys(values))
     return []
+
+
+def _iter_ws_market_storage_records(record: dict[str, Any]) -> list[dict[str, Any]]:
+    source = str(record.get("source", "ws_market"))
+    ts_ingest = str(record.get("ts_ingest", datetime.now(UTC).isoformat()))
+    payload = record.get("payload")
+    events = _iter_ws_market_events(payload)
+    if not events:
+        fallback_payload = payload if isinstance(payload, dict) else {"raw_message": payload}
+        return [
+            {
+                "source": source,
+                "ts_ingest": ts_ingest,
+                "payload": {
+                    "market": "unknown",
+                    "asset_id": "unknown",
+                    "timestamp": "",
+                    **fallback_payload,
+                },
+            }
+        ]
+
+    scoped_records: list[dict[str, Any]] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        event_market = _extract_ws_market_id(event)
+        if not event_market:
+            event_market = "unknown"
+
+        event_timestamp = event.get("timestamp")
+        price_changes = event.get("price_changes")
+        if isinstance(price_changes, list) and price_changes:
+            for change in price_changes:
+                if not isinstance(change, dict):
+                    continue
+                asset_id = str(change.get("asset_id") or "") or "unknown"
+                scoped_payload = {
+                    key: value
+                    for key, value in event.items()
+                    if key not in {"price_changes", "assets_ids"}
+                }
+                scoped_payload.update(change)
+                scoped_payload["market"] = event_market
+                scoped_payload["asset_id"] = asset_id
+                if "timestamp" not in scoped_payload:
+                    scoped_payload["timestamp"] = event_timestamp
+                scoped_records.append(
+                    {
+                        "source": source,
+                        "ts_ingest": ts_ingest,
+                        "payload": scoped_payload,
+                    }
+                )
+            continue
+
+        asset_ids = _extract_ws_assets_ids(event) or ["unknown"]
+        for asset_id in asset_ids:
+            scoped_payload = {
+                key: value
+                for key, value in event.items()
+                if key != "assets_ids"
+            }
+            scoped_payload["market"] = event_market
+            scoped_payload["asset_id"] = asset_id
+            if "timestamp" not in scoped_payload:
+                scoped_payload["timestamp"] = event_timestamp
+            scoped_records.append(
+                {
+                    "source": source,
+                    "ts_ingest": ts_ingest,
+                    "payload": scoped_payload,
+                }
+            )
+
+    return scoped_records
+
+
+def _extract_ws_market_id(event: dict[str, Any]) -> str:
+    for key in ("market", "condition_id", "conditionId"):
+        value = event.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def _coerce_event_datetime(value: Any) -> datetime | None:
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            numeric = float(text)
+        except ValueError:
+            return None
+    elif isinstance(value, (int, float)):
+        numeric = float(value)
+    else:
+        return None
+
+    if abs(numeric) >= 1e11:
+        numeric /= 1000.0
+    try:
+        return datetime.fromtimestamp(numeric, tz=UTC)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _safe_path_part(value: Any) -> str:
+    text = str(value).strip() if value is not None else ""
+    if not text:
+        return "unknown"
+    return text.replace("/", "_").replace("\\", "_")
 
 
 def _chunk_joined_values(*, values: list[str], max_joined_chars: int) -> list[list[str]]:

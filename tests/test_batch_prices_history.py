@@ -164,6 +164,72 @@ class BatchPricesHistoryTests(unittest.TestCase):
             self.assertEqual(dropped, 0)
             self.assertEqual([row["asset_id"] for row in rows], ["tok-a-1", "tok-a-2"])
 
+    def test_ws_market_raw_writer_partitions_by_market_and_asset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            collector = PolymarketCollector(CollectorConfig(data_root=Path(tmpdir), writer_node_id="node-a"))
+            wrapped = collector._wrap_ws_message(
+                "ws_market",
+                json.dumps(
+                    {
+                        "event_type": "price_change",
+                        "market": "cond-a",
+                        "side": "BUY",
+                        "timestamp": "1776762363235",
+                        "price_changes": [
+                            {
+                                "asset_id": "tok-a-1",
+                                "price": "0.41",
+                                "size": "5",
+                            },
+                            {
+                                "asset_id": "tok-a-2",
+                                "price": "0.59",
+                                "size": "7",
+                            },
+                        ],
+                    },
+                    ensure_ascii=True,
+                ),
+            )
+
+            path = collector.writer.write("ws_market", [wrapped])
+
+            self.assertIsNotNone(path)
+
+            asset_a = (
+                Path(tmpdir)
+                / "raw"
+                / "source=ws_market"
+                / "market=cond-a"
+                / "asset=tok-a-1"
+                / "dt=2026-04-21"
+                / "hour=09"
+                / "bucket_start=20260421T090000Z_node=node-a.jsonl.gz"
+            )
+            asset_b = (
+                Path(tmpdir)
+                / "raw"
+                / "source=ws_market"
+                / "market=cond-a"
+                / "asset=tok-a-2"
+                / "dt=2026-04-21"
+                / "hour=09"
+                / "bucket_start=20260421T090000Z_node=node-a.jsonl.gz"
+            )
+
+            self.assertTrue(asset_a.exists())
+            self.assertTrue(asset_b.exists())
+
+            with gzip.open(asset_a, "rt", encoding="utf-8") as handle:
+                row = json.loads(handle.readline())
+
+            self.assertEqual(row["payload"]["market"], "cond-a")
+            self.assertEqual(row["payload"]["asset_id"], "tok-a-1")
+            self.assertEqual(row["payload"]["event_type"], "price_change")
+            self.assertEqual(row["payload"]["timestamp"], "1776762363235")
+            self.assertEqual(row["payload"]["price"], "0.41")
+            self.assertNotIn("price_changes", row["payload"])
+
 
 if __name__ == "__main__":
     unittest.main()
