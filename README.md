@@ -277,6 +277,12 @@ du -sb data/raw
 
 在当前实现中，`ws_market` 会优先开始增长；即使 `trades` 等全量 REST 任务仍在运行，也应能看到 `data/raw/source=ws_market/market=.../asset=...` 持续写入。
 
+`ws_market` 当前采用极简落盘格式：
+
+- 仅保留带 `bids/asks` 的 `book` 事件
+- 文件内容只写 `timestamp`、`bids`、`asks`
+- `market` / `asset` 通过目录路径表达，不再重复写进 payload
+
 ## 数据布局
 
 原始层路径：
@@ -294,6 +300,7 @@ data/raw/source=ws_market/market=<market>/asset=<asset>/dt=YYYY-MM-DD/hour=HH/bu
 <data-root>/state/heartbeat_<node>.json
 <data-root>/state/failover_state.json
 <data-root>/state/market_universe.json
+<data-root>/state/run_metadata.json
 <data-root>/state/tracked_market_selection.json
 <data-root>/state/trade_frontier.json
 <data-root>/state/reports/dedup_report_*.json
@@ -325,6 +332,8 @@ ws_market
 - `books` / `oi` / `holders` / `history` 默认通过 `rest-worker-count=4` 并发执行，且每个任务使用独立 collector。
 - `trades` 默认通过 `trade-worker-count=4` 分片并发执行；每个 batch 完成后会立即更新 `trade_frontier.json`。
 - 每个 WS worker 都会按 `flush_every_messages=10` 或 `flush_every_seconds=1` 落盘；`ws_market` 会先按 `market/asset` 拆分，再按小时桶追加，不会每次 flush 新建文件。
+- `ws_market` raw payload 为最小格式：只保留 `timestamp/bids/asks`，并只落盘 `book` 类深度快照事件；`price_change`、`best_bid_ask`、`last_trade_price` 等事件不再写入 raw。
+- `run-primary` / `run-backup` 启动后会写 `state/run_metadata.json`，记录 `started_at`、`expected_finish_at`、`status`、`exit_reason`，并在正常结束或停止时更新。
 - HTTP 请求默认启用重试/退避（429/5xx、超时、连接失败），并支持 `Retry-After`。
 - `--include-closed-markets` / `--include-archived-markets` 可把非 active 市场纳入主循环发现范围。
 - `ws_market` 连接内会在收到 `new_market` 时立即追加订阅新市场资产，在收到 `market_resolved` 时立即取消该市场资产订阅；状态会回写到 `tracked_market_selection.json`。

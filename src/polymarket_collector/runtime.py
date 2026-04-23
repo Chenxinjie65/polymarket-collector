@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -194,11 +195,26 @@ def run_primary_loop(
     trade_max_offset: int,
     collect_midpoints: bool,
     collect_spreads: bool,
+    ws_only: bool,
 ) -> None:
     universe_state = _load_universe_state(data_root)
     snapshot_state = SnapshotScheduleState()
     trade_frontier = _load_trade_frontier_state(data_root)
     start = time.monotonic()
+    started_at = datetime.now(UTC)
+    _write_run_metadata(
+        data_root=data_root,
+        node_id=node_id,
+        role="primary",
+        started_at=started_at,
+        duration_seconds=duration_seconds,
+        status="running",
+        exit_reason=None,
+    )
+    print(
+        f"[{started_at.isoformat()}] run_primary_started node_id={node_id} data_root={data_root}",
+        flush=True,
+    )
     ws_collector = _BackgroundWsCollector(
         collector_config=collector.config,
         data_root=data_root,
@@ -211,6 +227,7 @@ def run_primary_loop(
     )
     ws_collector.start()
     previous_ws_raw_bytes = _source_raw_size_bytes(data_root=data_root, source="ws_market")
+    exit_reason = "stopped"
     try:
         while True:
             cycle_started = time.monotonic()
@@ -237,6 +254,7 @@ def run_primary_loop(
                     discover_all_pages=discover_all_pages,
                     market_limit=market_limit,
                     page_limit=page_limit,
+                    enabled=not ws_only,
                 )
                 cycle_state = _collect_cycle(
                     collector=collector,
@@ -265,6 +283,7 @@ def run_primary_loop(
                     trade_frontier=trade_frontier,
                     collect_midpoints=collect_midpoints,
                     collect_spreads=collect_spreads,
+                    ws_only=ws_only,
                     collect_ws_inline=False,
                     rest_worker_count=rest_worker_count,
                     trade_worker_count=trade_worker_count,
@@ -332,6 +351,7 @@ def run_primary_loop(
                         "books_cold_snapshot_count": cycle_state["books_cold_snapshot_count"],
                         "history_snapshot_asset_count": cycle_state["history_snapshot_asset_count"],
                         "tracked_market_selection_mode": "persistent" if freeze_tracked_markets else "dynamic",
+                        "ws_only": ws_only,
                         "tracked_condition_ids_count": len(persisted_tracked_selection.condition_ids),
                         "tracked_asset_ids_count": len(persisted_tracked_selection.asset_ids),
                         "tracked_added_condition_ids_count": len(persisted_tracked_selection.added_condition_ids),
@@ -360,6 +380,7 @@ def run_primary_loop(
                 )
 
             if duration_seconds > 0 and (time.monotonic() - start) >= duration_seconds:
+                exit_reason = "duration_reached"
                 return
 
             elapsed = time.monotonic() - cycle_started
@@ -368,6 +389,22 @@ def run_primary_loop(
                 time.sleep(sleep_seconds)
     finally:
         ws_collector.stop()
+        finished_at = datetime.now(UTC)
+        _write_run_metadata(
+            data_root=data_root,
+            node_id=node_id,
+            role="primary",
+            started_at=started_at,
+            duration_seconds=duration_seconds,
+            status="completed" if exit_reason == "duration_reached" else "stopped",
+            exit_reason=exit_reason,
+            finished_at=finished_at,
+        )
+        print(
+            f"[{finished_at.isoformat()}] run_primary_stopped node_id={node_id} "
+            f"exit_reason={exit_reason} data_root={data_root}",
+            flush=True,
+        )
 
 
 def run_backup_loop(
@@ -410,13 +447,29 @@ def run_backup_loop(
     trade_max_offset: int,
     collect_midpoints: bool,
     collect_spreads: bool,
+    ws_only: bool,
 ) -> None:
     universe_state = _load_universe_state(data_root)
     snapshot_state = SnapshotScheduleState()
     trade_frontier = _load_trade_frontier_state(data_root)
     start = time.monotonic()
+    started_at = datetime.now(UTC)
+    _write_run_metadata(
+        data_root=data_root,
+        node_id=node_id,
+        role="backup",
+        started_at=started_at,
+        duration_seconds=duration_seconds,
+        status="running",
+        exit_reason=None,
+    )
+    print(
+        f"[{started_at.isoformat()}] run_backup_started node_id={node_id} data_root={data_root}",
+        flush=True,
+    )
     ws_collector: _BackgroundWsCollector | None = None
     previous_ws_raw_bytes = _source_raw_size_bytes(data_root=data_root, source="ws_market")
+    exit_reason = "stopped"
     try:
         while True:
             cycle_started = time.monotonic()
@@ -461,6 +514,7 @@ def run_backup_loop(
                         discover_all_pages=discover_all_pages,
                         market_limit=market_limit,
                         page_limit=page_limit,
+                        enabled=not ws_only,
                     )
                     cycle_state = _collect_cycle(
                         collector=collector,
@@ -489,6 +543,7 @@ def run_backup_loop(
                         trade_frontier=trade_frontier,
                         collect_midpoints=collect_midpoints,
                         collect_spreads=collect_spreads,
+                        ws_only=ws_only,
                         collect_ws_inline=False,
                         rest_worker_count=rest_worker_count,
                         trade_worker_count=trade_worker_count,
@@ -557,6 +612,7 @@ def run_backup_loop(
                             "books_cold_snapshot_count": cycle_state["books_cold_snapshot_count"],
                             "history_snapshot_asset_count": cycle_state["history_snapshot_asset_count"],
                             "tracked_market_selection_mode": "persistent" if freeze_tracked_markets else "dynamic",
+                            "ws_only": ws_only,
                             "tracked_condition_ids_count": len(persisted_tracked_selection.condition_ids),
                             "tracked_asset_ids_count": len(persisted_tracked_selection.asset_ids),
                             "tracked_added_condition_ids_count": len(persisted_tracked_selection.added_condition_ids),
@@ -600,6 +656,7 @@ def run_backup_loop(
                 )
 
             if duration_seconds > 0 and (time.monotonic() - start) >= duration_seconds:
+                exit_reason = "duration_reached"
                 return
 
             elapsed = time.monotonic() - cycle_started
@@ -609,6 +666,22 @@ def run_backup_loop(
     finally:
         if ws_collector is not None:
             ws_collector.stop()
+        finished_at = datetime.now(UTC)
+        _write_run_metadata(
+            data_root=data_root,
+            node_id=node_id,
+            role="backup",
+            started_at=started_at,
+            duration_seconds=duration_seconds,
+            status="completed" if exit_reason == "duration_reached" else "stopped",
+            exit_reason=exit_reason,
+            finished_at=finished_at,
+        )
+        print(
+            f"[{finished_at.isoformat()}] run_backup_stopped node_id={node_id} "
+            f"exit_reason={exit_reason} data_root={data_root}",
+            flush=True,
+        )
 
 
 def _write_latest_markets(data_root: Path, markets: list[dict[str, Any]]) -> Path:
@@ -708,7 +781,10 @@ def _discover_events_for_cycle(
     discover_all_pages: bool,
     market_limit: int,
     page_limit: int,
+    enabled: bool = True,
 ) -> tuple[int, list[str]]:
+    if not enabled:
+        return 0, []
     try:
         if discover_all_pages:
             events = collector.discover_events_all_pages(page_limit=page_limit)
@@ -748,6 +824,7 @@ def _collect_cycle(
     trade_frontier: dict[str, Any],
     collect_midpoints: bool,
     collect_spreads: bool,
+    ws_only: bool = False,
     collect_ws_inline: bool = True,
     rest_worker_count: int = 4,
     trade_worker_count: int = 4,
@@ -767,84 +844,87 @@ def _collect_cycle(
     collector_factory = _build_parallel_collector_factory(collector)
 
     # 1) Normal cycle collection for current known universe.
-    tracked_trade_condition_ids = _limit_items(tracked_condition_ids, max_markets_for_trades)
-    trade_frontier, hit_trade_offset_cap, trade_warnings = _collect_trade_batches(
-        collector_factory=collector_factory,
-        condition_ids=tracked_trade_condition_ids,
-        full_trades_for_tracked_markets=full_trades_for_tracked_markets,
-        trade_page_limit=trade_page_limit,
-        trade_max_offset=trade_max_offset,
-        trade_frontier=trade_frontier,
-        trade_worker_count=trade_worker_count,
-        warning_prefix="fetch_trades",
-        on_trade_frontier_update=on_trade_frontier_update,
-    )
-    collection_warnings.extend(trade_warnings)
-    if hit_trade_offset_cap:
-        collection_warnings.append("fetch_trades_reached_offset_cap")
+    hit_trade_offset_cap = False
+    if not ws_only:
+        tracked_trade_condition_ids = _limit_items(tracked_condition_ids, max_markets_for_trades)
+        trade_frontier, hit_trade_offset_cap, trade_warnings = _collect_trade_batches(
+            collector_factory=collector_factory,
+            condition_ids=tracked_trade_condition_ids,
+            full_trades_for_tracked_markets=full_trades_for_tracked_markets,
+            trade_page_limit=trade_page_limit,
+            trade_max_offset=trade_max_offset,
+            trade_frontier=trade_frontier,
+            trade_worker_count=trade_worker_count,
+            warning_prefix="fetch_trades",
+            on_trade_frontier_update=on_trade_frontier_update,
+        )
+        collection_warnings.extend(trade_warnings)
+        if hit_trade_offset_cap:
+            collection_warnings.append("fetch_trades_reached_offset_cap")
 
-    oi_condition_ids = _limit_items(tracked_condition_ids, max_markets_for_oi_holders)
+    oi_condition_ids = [] if ws_only else _limit_items(tracked_condition_ids, max_markets_for_oi_holders)
     oi_holders_market_count = len(oi_condition_ids)
     books_hot_snapshot_count = 0
     books_cold_snapshot_count = 0
     history_snapshot_asset_count = 0
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, rest_worker_count)) as executor:
-        futures: dict[str, concurrent.futures.Future[Any]] = {
-            "books": executor.submit(
-                _collect_tiered_book_snapshots,
-                collector_factory=collector_factory,
-                asset_ids=tracked_asset_ids,
-                max_assets_for_books=max_assets_for_books,
-                hot_assets_for_books=hot_assets_for_books,
-                hot_snapshot_interval_seconds=hot_snapshot_interval_seconds,
-                cold_snapshot_interval_seconds=cold_snapshot_interval_seconds,
-                snapshot_state=snapshot_state,
-                collect_midpoints=collect_midpoints,
-                collect_spreads=collect_spreads,
-            ),
-            "history": executor.submit(
-                _collect_history_snapshots,
-                collector_factory=collector_factory,
-                asset_ids=tracked_asset_ids,
-                max_assets_for_history=max_assets_for_history,
-                history_snapshot_interval_seconds=history_snapshot_interval_seconds,
-                history_window_seconds=history_window_seconds,
-                history_interval=history_interval,
-                history_fidelity=history_fidelity,
-                snapshot_state=snapshot_state,
-            ),
-        }
-        if oi_holders_market_count > 0:
-            futures["oi"] = executor.submit(
-                _run_open_interest_snapshot,
-                collector_factory=collector_factory,
-                condition_ids=oi_condition_ids,
-            )
-            futures["holders"] = executor.submit(
-                _run_holders_snapshot,
-                collector_factory=collector_factory,
-                condition_ids=oi_condition_ids,
-            )
+    if not ws_only:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, rest_worker_count)) as executor:
+            futures: dict[str, concurrent.futures.Future[Any]] = {
+                "books": executor.submit(
+                    _collect_tiered_book_snapshots,
+                    collector_factory=collector_factory,
+                    asset_ids=tracked_asset_ids,
+                    max_assets_for_books=max_assets_for_books,
+                    hot_assets_for_books=hot_assets_for_books,
+                    hot_snapshot_interval_seconds=hot_snapshot_interval_seconds,
+                    cold_snapshot_interval_seconds=cold_snapshot_interval_seconds,
+                    snapshot_state=snapshot_state,
+                    collect_midpoints=collect_midpoints,
+                    collect_spreads=collect_spreads,
+                ),
+                "history": executor.submit(
+                    _collect_history_snapshots,
+                    collector_factory=collector_factory,
+                    asset_ids=tracked_asset_ids,
+                    max_assets_for_history=max_assets_for_history,
+                    history_snapshot_interval_seconds=history_snapshot_interval_seconds,
+                    history_window_seconds=history_window_seconds,
+                    history_interval=history_interval,
+                    history_fidelity=history_fidelity,
+                    snapshot_state=snapshot_state,
+                ),
+            }
+            if oi_holders_market_count > 0:
+                futures["oi"] = executor.submit(
+                    _run_open_interest_snapshot,
+                    collector_factory=collector_factory,
+                    condition_ids=oi_condition_ids,
+                )
+                futures["holders"] = executor.submit(
+                    _run_holders_snapshot,
+                    collector_factory=collector_factory,
+                    condition_ids=oi_condition_ids,
+                )
 
-        for name, future in futures.items():
-            try:
-                result = future.result()
-            except Exception as exc:  # noqa: BLE001
+            for name, future in futures.items():
+                try:
+                    result = future.result()
+                except Exception as exc:  # noqa: BLE001
+                    if name == "books":
+                        collection_warnings.append(f"book_snapshot_failed:{exc}")
+                    elif name == "history":
+                        collection_warnings.append(f"history_snapshot_failed:{exc}")
+                    elif name == "oi":
+                        collection_warnings.append(f"fetch_open_interest_failed:{exc}")
+                    elif name == "holders":
+                        collection_warnings.append(f"fetch_holders_failed:{exc}")
+                    continue
+
                 if name == "books":
-                    collection_warnings.append(f"book_snapshot_failed:{exc}")
+                    books_hot_snapshot_count, books_cold_snapshot_count = result
                 elif name == "history":
-                    collection_warnings.append(f"history_snapshot_failed:{exc}")
-                elif name == "oi":
-                    collection_warnings.append(f"fetch_open_interest_failed:{exc}")
-                elif name == "holders":
-                    collection_warnings.append(f"fetch_holders_failed:{exc}")
-                continue
-
-            if name == "books":
-                books_hot_snapshot_count, books_cold_snapshot_count = result
-            elif name == "history":
-                history_snapshot_asset_count = result
+                    history_snapshot_asset_count = result
 
     ws_asset_ids = _limit_items(tracked_asset_ids, max_assets_for_ws)
     if collect_ws_inline and ws_asset_ids:
@@ -868,7 +948,7 @@ def _collect_cycle(
 
     # 2) Bootstrap collection for newly discovered markets/tokens.
     bootstrap_trade_condition_ids = tracked_added_condition_ids if freeze_tracked_markets else new_condition_ids
-    if bootstrap_trade_condition_ids:
+    if bootstrap_trade_condition_ids and not ws_only:
         bootstrap_trade_condition_ids = _limit_items(bootstrap_trade_condition_ids, max_markets_for_trades)
         trade_frontier, bootstrap_hit_trade_offset_cap, bootstrap_trade_warnings = _collect_trade_batches(
             collector_factory=collector_factory,
@@ -887,7 +967,7 @@ def _collect_cycle(
 
     bootstrap_warnings: list[str] = []
     bootstrap_asset_ids = tracked_added_asset_ids if freeze_tracked_markets else new_asset_ids
-    if bootstrap_asset_ids:
+    if bootstrap_asset_ids and not ws_only:
         bootstrap_assets = _limit_items(bootstrap_asset_ids, max_assets_for_books)
         bootstrap_history_assets = _limit_items(bootstrap_assets, max_assets_for_history)
         with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(rest_worker_count, 2))) as executor:
@@ -1456,4 +1536,44 @@ def _append_runtime_alert(*, data_root: Path, payload: dict[str, Any]) -> Path:
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=True, separators=(",", ":")))
         handle.write("\n")
+    return path
+
+
+def _write_run_metadata(
+    *,
+    data_root: Path,
+    node_id: str,
+    role: str,
+    started_at: datetime,
+    duration_seconds: int,
+    status: str,
+    exit_reason: str | None,
+    finished_at: datetime | None = None,
+) -> Path:
+    state_dir = data_root / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    path = state_dir / "run_metadata.json"
+    expected_finish_at = None
+    if duration_seconds > 0:
+        expected_finish_at = started_at.timestamp() + duration_seconds
+    payload: dict[str, Any] = {
+        "node_id": node_id,
+        "role": role,
+        "pid": os.getpid(),
+        "status": status,
+        "exit_reason": exit_reason,
+        "started_at": started_at.isoformat(),
+        "duration_seconds": duration_seconds,
+        "expected_finish_at": (
+            datetime.fromtimestamp(expected_finish_at, tz=UTC).isoformat()
+            if expected_finish_at is not None
+            else None
+        ),
+        "updated_at": datetime.now(UTC).isoformat(),
+    }
+    if finished_at is not None:
+        payload["finished_at"] = finished_at.isoformat()
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+    tmp_path.replace(path)
     return path

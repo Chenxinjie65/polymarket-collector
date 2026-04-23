@@ -137,18 +137,27 @@ class BatchPricesHistoryTests(unittest.TestCase):
         self.assertFalse(args.include_archived_markets)
         self.assertFalse(args.collect_midpoints)
         self.assertFalse(args.collect_spreads)
+        self.assertFalse(args.ws_only)
 
-    def test_normalized_ws_market_keeps_each_asset_from_multi_asset_event(self) -> None:
+    def test_normalized_ws_market_recovers_market_and_asset_from_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            raw_path = Path(tmpdir) / "ws.jsonl.gz"
+            raw_path = (
+                Path(tmpdir)
+                / "source=ws_market"
+                / "market=cond-a"
+                / "asset=tok-a-1"
+                / "dt=2026-04-19"
+                / "hour=00"
+                / "bucket_start=20260419T000000Z_node=node-a.jsonl.gz"
+            )
+            raw_path.parent.mkdir(parents=True, exist_ok=True)
             record = {
                 "source": "ws_market",
                 "ts_ingest": "2026-04-19T00:00:00+00:00",
                 "payload": {
-                    "event_type": "new_market",
-                    "condition_id": "cond-a",
-                    "assets_ids": ["tok-a-1", "tok-a-2"],
                     "timestamp": "123",
+                    "bids": [{"price": "0.4", "size": "10"}],
+                    "asks": [{"price": "0.6", "size": "12"}],
                 },
             }
             with gzip.open(raw_path, "wt", encoding="utf-8") as handle:
@@ -162,7 +171,12 @@ class BatchPricesHistoryTests(unittest.TestCase):
             )
 
             self.assertEqual(dropped, 0)
-            self.assertEqual([row["asset_id"] for row in rows], ["tok-a-1", "tok-a-2"])
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["condition_id"], "cond-a")
+            self.assertEqual(rows[0]["asset_id"], "tok-a-1")
+            self.assertEqual(rows[0]["event_type"], "book")
+            self.assertEqual(rows[0]["best_bid"], 0.4)
+            self.assertEqual(rows[0]["best_ask"], 0.6)
 
     def test_ws_market_raw_writer_partitions_by_market_and_asset(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -171,22 +185,12 @@ class BatchPricesHistoryTests(unittest.TestCase):
                 "ws_market",
                 json.dumps(
                     {
-                        "event_type": "price_change",
+                        "event_type": "book",
                         "market": "cond-a",
-                        "side": "BUY",
                         "timestamp": "1776762363235",
-                        "price_changes": [
-                            {
-                                "asset_id": "tok-a-1",
-                                "price": "0.41",
-                                "size": "5",
-                            },
-                            {
-                                "asset_id": "tok-a-2",
-                                "price": "0.59",
-                                "size": "7",
-                            },
-                        ],
+                        "asset_id": "tok-a-1",
+                        "bids": [{"price": "0.41", "size": "5"}],
+                        "asks": [{"price": "0.59", "size": "7"}],
                     },
                     ensure_ascii=True,
                 ),
@@ -206,29 +210,39 @@ class BatchPricesHistoryTests(unittest.TestCase):
                 / "hour=09"
                 / "bucket_start=20260421T090000Z_node=node-a.jsonl.gz"
             )
-            asset_b = (
-                Path(tmpdir)
-                / "raw"
-                / "source=ws_market"
-                / "market=cond-a"
-                / "asset=tok-a-2"
-                / "dt=2026-04-21"
-                / "hour=09"
-                / "bucket_start=20260421T090000Z_node=node-a.jsonl.gz"
-            )
-
             self.assertTrue(asset_a.exists())
-            self.assertTrue(asset_b.exists())
 
             with gzip.open(asset_a, "rt", encoding="utf-8") as handle:
                 row = json.loads(handle.readline())
 
-            self.assertEqual(row["payload"]["market"], "cond-a")
-            self.assertEqual(row["payload"]["asset_id"], "tok-a-1")
-            self.assertEqual(row["payload"]["event_type"], "price_change")
             self.assertEqual(row["payload"]["timestamp"], "1776762363235")
-            self.assertEqual(row["payload"]["price"], "0.41")
-            self.assertNotIn("price_changes", row["payload"])
+            self.assertEqual(row["payload"]["bids"], [{"price": "0.41", "size": "5"}])
+            self.assertEqual(row["payload"]["asks"], [{"price": "0.59", "size": "7"}])
+            self.assertNotIn("market", row["payload"])
+            self.assertNotIn("asset_id", row["payload"])
+
+    def test_ws_market_raw_writer_ignores_non_book_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            collector = PolymarketCollector(CollectorConfig(data_root=Path(tmpdir), writer_node_id="node-a"))
+            wrapped = collector._wrap_ws_message(
+                "ws_market",
+                json.dumps(
+                    {
+                        "event_type": "price_change",
+                        "market": "cond-a",
+                        "asset_id": "tok-a-1",
+                        "timestamp": "1776762363235",
+                        "price": "0.41",
+                        "size": "5",
+                    },
+                    ensure_ascii=True,
+                ),
+            )
+
+            path = collector.writer.write("ws_market", [wrapped])
+
+            self.assertIsNone(path)
+            self.assertFalse((Path(tmpdir) / "raw").exists())
 
 
 if __name__ == "__main__":

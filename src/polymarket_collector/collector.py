@@ -111,12 +111,8 @@ class JsonlGzWriter:
         grouped_records: dict[Path, list[dict[str, Any]]] = {}
         for record in records:
             for scoped_record in _iter_ws_market_storage_records(record):
-                payload = scoped_record.get("payload")
-                market = "unknown"
-                asset_id = "unknown"
-                if isinstance(payload, dict):
-                    market = _safe_path_part(payload.get("market") or payload.get("condition_id"))
-                    asset_id = _safe_path_part(payload.get("asset_id"))
+                market = _safe_path_part(scoped_record.get("market"))
+                asset_id = _safe_path_part(scoped_record.get("asset_id"))
                 bucket_start = self._bucket_start(scoped_record)
                 path = (
                     self.root
@@ -910,19 +906,7 @@ def _iter_ws_market_storage_records(record: dict[str, Any]) -> list[dict[str, An
     payload = record.get("payload")
     events = _iter_ws_market_events(payload)
     if not events:
-        fallback_payload = payload if isinstance(payload, dict) else {"raw_message": payload}
-        return [
-            {
-                "source": source,
-                "ts_ingest": ts_ingest,
-                "payload": {
-                    "market": "unknown",
-                    "asset_id": "unknown",
-                    "timestamp": "",
-                    **fallback_payload,
-                },
-            }
-        ]
+        return []
 
     scoped_records: list[dict[str, Any]] = []
     for event in events:
@@ -932,47 +916,25 @@ def _iter_ws_market_storage_records(record: dict[str, Any]) -> list[dict[str, An
         if not event_market:
             event_market = "unknown"
 
-        event_timestamp = event.get("timestamp")
-        price_changes = event.get("price_changes")
-        if isinstance(price_changes, list) and price_changes:
-            for change in price_changes:
-                if not isinstance(change, dict):
-                    continue
-                asset_id = str(change.get("asset_id") or "") or "unknown"
-                scoped_payload = {
-                    key: value
-                    for key, value in event.items()
-                    if key not in {"price_changes", "assets_ids"}
-                }
-                scoped_payload.update(change)
-                scoped_payload["market"] = event_market
-                scoped_payload["asset_id"] = asset_id
-                if "timestamp" not in scoped_payload:
-                    scoped_payload["timestamp"] = event_timestamp
-                scoped_records.append(
-                    {
-                        "source": source,
-                        "ts_ingest": ts_ingest,
-                        "payload": scoped_payload,
-                    }
-                )
+        bids = event.get("bids")
+        asks = event.get("asks")
+        if not isinstance(bids, list) and not isinstance(asks, list):
             continue
 
+        event_timestamp = event.get("timestamp")
         asset_ids = _extract_ws_assets_ids(event) or ["unknown"]
         for asset_id in asset_ids:
             scoped_payload = {
-                key: value
-                for key, value in event.items()
-                if key != "assets_ids"
+                "timestamp": event_timestamp,
+                "bids": bids if isinstance(bids, list) else [],
+                "asks": asks if isinstance(asks, list) else [],
             }
-            scoped_payload["market"] = event_market
-            scoped_payload["asset_id"] = asset_id
-            if "timestamp" not in scoped_payload:
-                scoped_payload["timestamp"] = event_timestamp
             scoped_records.append(
                 {
                     "source": source,
                     "ts_ingest": ts_ingest,
+                    "market": event_market,
+                    "asset_id": asset_id,
                     "payload": scoped_payload,
                 }
             )

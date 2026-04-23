@@ -186,7 +186,7 @@ def _read_rows_for_parquet(*, raw_path: Path, source: str, dedup: bool) -> tuple
                 continue
 
             payload = record.get("payload")
-            key = _extract_record_key(source=source, payload=payload)
+            key = _record_dedup_key(source=source, payload=payload, raw_path=raw_path)
             if dedup and key in seen:
                 dropped += 1
                 continue
@@ -226,7 +226,7 @@ def _read_rows_for_normalized_parquet(
             if source == "data_trades":
                 normalized = _normalize_data_trade_record(record)
             elif source == "ws_market":
-                normalized = _normalize_ws_market_record(record)
+                normalized = _normalize_ws_market_record(record, raw_path=raw_path)
             else:
                 normalized = []
 
@@ -265,70 +265,35 @@ def _normalize_data_trade_record(record: dict[str, Any]) -> list[dict[str, Any]]
     ]
 
 
-def _normalize_ws_market_record(record: dict[str, Any]) -> list[dict[str, Any]]:
+def _normalize_ws_market_record(record: dict[str, Any], *, raw_path: Path) -> list[dict[str, Any]]:
     payload = record.get("payload")
-    events = _iter_ws_events(payload)
-    if not events:
+    if not isinstance(payload, dict):
         return []
-
-    normalized_rows: list[dict[str, Any]] = []
-    for event in events:
-        event_type = _as_str(event.get("event_type"))
-        condition_id = _as_str(event.get("condition_id") or event.get("market"))
-        event_ts = _as_int(event.get("timestamp"))
-        side = _as_str(event.get("side"))
-        base_asset_ids = _extract_event_asset_ids(event)
-        price_changes = event.get("price_changes")
-
-        if isinstance(price_changes, list) and price_changes:
-            for change in price_changes:
-                if not isinstance(change, dict):
-                    continue
-                asset_id = _as_str(change.get("asset_id")) or (base_asset_ids[0] if base_asset_ids else "")
-                normalized_rows.append(
-                    {
-                        "_dedup_key": _extract_record_key(source="ws_market", payload=change)
-                        + "|"
-                        + _as_str(event_ts)
-                        + "|"
-                        + condition_id
-                        + "|"
-                        + event_type,
-                        "source": record.get("source", "ws_market"),
-                        "ts_ingest": str(record.get("ts_ingest", "")),
-                        "event_type": event_type,
-                        "condition_id": condition_id,
-                        "asset_id": asset_id,
-                        "side": side,
-                        "timestamp": event_ts,
-                        "price": _as_float(change.get("price")),
-                        "size": _as_float(change.get("size")),
-                        "best_bid": _as_float(change.get("best_bid")),
-                        "best_ask": _as_float(change.get("best_ask")),
-                    }
-                )
-            continue
-
-        fallback_assets = base_asset_ids if base_asset_ids else [""]
-        for asset_id in fallback_assets:
-            normalized_rows.append(
-                {
-                    "_dedup_key": _extract_record_key(source="ws_market", payload=event) + "|" + asset_id,
-                    "source": record.get("source", "ws_market"),
-                    "ts_ingest": str(record.get("ts_ingest", "")),
-                    "event_type": event_type,
-                    "condition_id": condition_id,
-                    "asset_id": asset_id,
-                    "side": side,
-                    "timestamp": event_ts,
-                    "price": _as_float(event.get("price")),
-                    "size": _as_float(event.get("size")),
-                    "best_bid": _as_float(event.get("best_bid")),
-                    "best_ask": _as_float(event.get("best_ask")),
-                }
-            )
-
-    return normalized_rows
+    partition = _extract_ws_partition_keys(raw_path)
+    bids = payload.get("bids")
+    asks = payload.get("asks")
+    best_bid = None
+    if isinstance(bids, list) and bids and isinstance(bids[0], dict):
+        best_bid = _as_float(bids[0].get("price"))
+    best_ask = None
+    if isinstance(asks, list) and asks and isinstance(asks[0], dict):
+        best_ask = _as_float(asks[0].get("price"))
+    return [
+        {
+            "_dedup_key": _record_dedup_key(source="ws_market", payload=payload, raw_path=raw_path),
+            "source": record.get("source", "ws_market"),
+            "ts_ingest": str(record.get("ts_ingest", "")),
+            "event_type": "book",
+            "condition_id": partition["market"],
+            "asset_id": partition["asset"],
+            "side": "",
+            "timestamp": _as_int(payload.get("timestamp")),
+            "price": None,
+            "size": None,
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+        }
+    ]
 
 
 def _iter_ws_events(payload: Any) -> list[dict[str, Any]]:
@@ -349,6 +314,25 @@ def _extract_event_asset_ids(event: dict[str, Any]) -> list[str]:
     if asset_id:
         return [asset_id]
     return []
+
+
+def _record_dedup_key(*, source: str, payload: Any, raw_path: Path) -> str:
+    key = _extract_record_key(source=source, payload=payload)
+    if source != "ws_market":
+        return key
+    partition = _extract_ws_partition_keys(raw_path)
+    return "|".join((key, partition["market"], partition["asset"]))
+
+
+def _extract_ws_partition_keys(raw_path: Path) -> dict[str, str]:
+    market = ""
+    asset = ""
+    for part in raw_path.parts:
+        if part.startswith("market="):
+            market = part.split("=", 1)[1]
+        elif part.startswith("asset="):
+            asset = part.split("=", 1)[1]
+    return {"market": market, "asset": asset}
 
 
 def _empty_normalized_columns(source: str) -> dict[str, list[Any]]:

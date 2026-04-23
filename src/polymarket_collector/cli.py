@@ -300,6 +300,7 @@ def main() -> int:
             trade_max_offset=args.trade_max_offset,
             collect_midpoints=args.collect_midpoints,
             collect_spreads=args.collect_spreads,
+            ws_only=args.ws_only,
         )
         print("run_primary_completed=true")
         return 0
@@ -344,6 +345,7 @@ def main() -> int:
             trade_max_offset=args.trade_max_offset,
             collect_midpoints=args.collect_midpoints,
             collect_spreads=args.collect_spreads,
+            ws_only=args.ws_only,
         )
         print("run_backup_completed=true")
         return 0
@@ -735,6 +737,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Collect spread snapshots together with book snapshots",
     )
+    primary.add_argument(
+        "--ws-only",
+        action="store_true",
+        help="Disable trades, oi, holders, books, history, and event discovery; keep only market discovery plus background ws_market collection",
+    )
 
     backup = subparsers.add_parser("run-backup", help="Run backup failover loop")
     backup.add_argument("--node-id", default="cloud-backup", help="Backup node id")
@@ -881,6 +888,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--collect-spreads",
         action="store_true",
         help="Collect spread snapshots together with book snapshots",
+    )
+    backup.add_argument(
+        "--ws-only",
+        action="store_true",
+        help="Disable trades, oi, holders, books, history, and event discovery; keep only market discovery plus background ws_market collection",
     )
 
     return parser
