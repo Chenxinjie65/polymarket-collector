@@ -1,4 +1,7 @@
 # Current Collector Workflow
+启动json采集版本的脚本进程，资源监控进程
+webscoket推送price_change和book两种事件，现在这个脚本只记录了book推送，将price_change也记录上。然后启动采集和资源监控脚本
+启动json采集的脚本进程，资源监控进程，运行5分钟后统计这个采集脚本的内存需求，磁盘需求，网络带宽需求情况，并估计天/月的磁盘需求，如果按代码中的方式压缩，压缩后的天/月的磁盘需求。以及如果我部署在服务器上运行，服务器的内存，cpu（几核几线程）才足够支持这个采集脚本的运行。
 
 This version optimizes for low CPU usage.
 
