@@ -67,8 +67,8 @@ class CollectorState:
     data_root: Path
     meta_path: Path
     market_catalog: dict[str, MarketMeta]
-    asset_to_market: dict[str, str]
-    shard_assets: list[set[str]]
+    asset_to_shard: dict[str, int]
+    shard_loads: list[int]
     shard_commands: list[asyncio.Queue]
     resolved_markets: set[str]
     meta_lock: asyncio.Lock
@@ -89,7 +89,7 @@ def parse_args() -> argparse.Namespace:
         help="Run duration; use 0 or a negative value to keep running",
     )
     parser.add_argument("--page-limit", type=int, default=500, help="Gamma page size")
-    parser.add_argument("--chunk-size", type=int, default=500, help="Assets per websocket connection")
+    parser.add_argument("--chunk-size", type=int, default=2000, help="Assets per websocket connection")
     parser.add_argument(
         "--proxy-url",
         default="",
@@ -103,7 +103,13 @@ def parse_args() -> argparse.Namespace:
         default=90.0,
         help="Reconnect a websocket if no usable book messages arrive for this long.",
     )
-    parser.add_argument("--queue-maxsize", type=int, default=10000, help="Writer queue size")
+    parser.add_argument("--queue-maxsize", type=int, default=256, help="Writer queue size")
+    parser.add_argument(
+        "--ws-max-queue",
+        type=int,
+        default=1,
+        help="Max queued websocket messages per connection before applying backpressure.",
+    )
     parser.add_argument("--summary-file", default="run_summary.json", help="Summary path under state/")
     parser.add_argument(
         "--event-anchor-assets",
@@ -244,17 +250,39 @@ def normalize_books_payload(payload: Any) -> list[dict[str, Any]]:
 
 
 def normalize_market_events_payload(payload: Any) -> list[dict[str, Any]]:
-    items = normalize_books_payload(payload)
     normalized: list[dict[str, Any]] = []
-    for item in items:
+    for item in normalize_payload_items(payload):
         event_type = str(item.get("event_type") or "")
-        if not event_type and ("bids" in item or "asks" in item):
-            item = dict(item)
-            item["event_type"] = "book"
-            normalized.append(item)
+
+        if not event_type and item.get("asset_id") and item.get("market") and ("bids" in item or "asks" in item):
+            book_item = dict(item)
+            book_item["event_type"] = "book"
+            normalized.append(book_item)
             continue
-        if event_type in {"book", "price_change"}:
-            normalized.append(item)
+
+        if event_type == "book":
+            if item.get("asset_id") and item.get("market"):
+                normalized.append(item)
+            continue
+
+        if event_type == "price_change":
+            market_id = str(item.get("market") or "")
+            timestamp = str(item.get("timestamp") or "")
+            price_changes = item.get("price_changes")
+            if not market_id or not isinstance(price_changes, list):
+                continue
+            for change in price_changes:
+                if not isinstance(change, dict):
+                    continue
+                asset_id = str(change.get("asset_id") or "")
+                if not asset_id:
+                    continue
+                expanded = dict(change)
+                expanded["event_type"] = "price_change"
+                expanded["market"] = market_id
+                if timestamp and expanded.get("timestamp") in (None, ""):
+                    expanded["timestamp"] = timestamp
+                normalized.append(expanded)
     return normalized
 
 
@@ -312,12 +340,14 @@ def compact_price_change_record(*, asset_index: int, price_change: dict[str, Any
     return record
 
 
-def build_asset_to_market(market_catalog: dict[str, MarketMeta]) -> dict[str, str]:
-    asset_to_market: dict[str, str] = {}
-    for market_id, market_meta in market_catalog.items():
-        for asset in market_meta.assets:
-            asset_to_market[asset.asset_id] = market_id
-    return asset_to_market
+def build_asset_to_shard(chunks: list[list[str]]) -> tuple[dict[str, int], list[int]]:
+    asset_to_shard: dict[str, int] = {}
+    shard_loads: list[int] = []
+    for shard_index, chunk in enumerate(chunks):
+        shard_loads.append(len(chunk))
+        for asset_id in chunk:
+            asset_to_shard[asset_id] = shard_index
+    return asset_to_shard, shard_loads
 
 
 def write_all_market_meta(meta_path: Path, market_catalog: dict[str, MarketMeta]) -> None:
@@ -354,8 +384,8 @@ async def persist_market_catalog(state: CollectorState) -> None:
         snapshot = dict(state.market_catalog)
         await asyncio.to_thread(write_all_market_meta, state.meta_path, snapshot)
 
-def choose_shard_index(shard_assets: list[set[str]]) -> int:
-    return min(range(len(shard_assets)), key=lambda idx: len(shard_assets[idx]))
+def choose_shard_index(shard_loads: list[int]) -> int:
+    return min(range(len(shard_loads)), key=shard_loads.__getitem__)
 
 
 async def add_new_markets(state: CollectorState, market_metas: list[MarketMeta], stats: RunStats) -> int:
@@ -372,11 +402,11 @@ async def add_new_markets(state: CollectorState, market_metas: list[MarketMeta],
         added_markets += 1
 
         for asset in market_meta.assets:
-            if asset.asset_id in state.asset_to_market:
+            if asset.asset_id in state.asset_to_shard:
                 continue
-            shard_index = choose_shard_index(state.shard_assets)
-            state.shard_assets[shard_index].add(asset.asset_id)
-            state.asset_to_market[asset.asset_id] = market_meta.market_id
+            shard_index = choose_shard_index(state.shard_loads)
+            state.shard_loads[shard_index] += 1
+            state.asset_to_shard[asset.asset_id] = shard_index
             pending_by_shard.setdefault(shard_index, []).append(asset.asset_id)
 
     if not added_markets:
@@ -387,7 +417,7 @@ async def add_new_markets(state: CollectorState, market_metas: list[MarketMeta],
         await state.shard_commands[shard_index].put({"op": "subscribe", "asset_ids": asset_ids})
 
     stats.markets_total = len(state.market_catalog)
-    stats.assets_total = len(state.asset_to_market)
+    stats.assets_total = len(state.asset_to_shard)
     stats.new_markets_added += added_markets
     return added_markets
 
@@ -411,11 +441,11 @@ async def upsert_market_meta(
         state.market_catalog[market_meta.market_id] = market_meta
         changed = True
         for asset in market_meta.assets:
-            if asset.asset_id in state.asset_to_market:
+            if asset.asset_id in state.asset_to_shard:
                 continue
-            shard_index = choose_shard_index(state.shard_assets)
-            state.shard_assets[shard_index].add(asset.asset_id)
-            state.asset_to_market[asset.asset_id] = market_meta.market_id
+            shard_index = choose_shard_index(state.shard_loads)
+            state.shard_loads[shard_index] += 1
+            state.asset_to_shard[asset.asset_id] = shard_index
             pending_by_shard.setdefault(shard_index, []).append(asset.asset_id)
         stats.new_markets_added += 1
     else:
@@ -439,9 +469,9 @@ async def upsert_market_meta(
                 existing_assets[new_asset.asset_id] = new_asset
                 next_index += 1
                 changed = True
-                shard_index = choose_shard_index(state.shard_assets)
-                state.shard_assets[shard_index].add(new_asset.asset_id)
-                state.asset_to_market[new_asset.asset_id] = market_meta.market_id
+                shard_index = choose_shard_index(state.shard_loads)
+                state.shard_loads[shard_index] += 1
+                state.asset_to_shard[new_asset.asset_id] = shard_index
                 pending_by_shard.setdefault(shard_index, []).append(new_asset.asset_id)
 
         updated = MarketMeta(
@@ -474,7 +504,7 @@ async def upsert_market_meta(
         await state.shard_commands[shard_index].put({"op": "subscribe", "asset_ids": asset_ids})
 
     stats.markets_total = len(state.market_catalog)
-    stats.assets_total = len(state.asset_to_market)
+    stats.assets_total = len(state.asset_to_shard)
     return True
 
 
@@ -543,19 +573,18 @@ async def handle_market_resolved(
     pending_by_shard: dict[int, list[str]] = {}
 
     for asset in market_meta.assets:
-        state.asset_to_market.pop(asset.asset_id, None)
-        for shard_index, assets in enumerate(state.shard_assets):
-            if asset.asset_id in assets:
-                assets.remove(asset.asset_id)
-                pending_by_shard.setdefault(shard_index, []).append(asset.asset_id)
-                break
+        shard_index = state.asset_to_shard.pop(asset.asset_id, None)
+        if shard_index is None:
+            continue
+        state.shard_loads[shard_index] = max(0, state.shard_loads[shard_index] - 1)
+        pending_by_shard.setdefault(shard_index, []).append(asset.asset_id)
 
     await persist_market_catalog(state)
     for shard_index, asset_ids in pending_by_shard.items():
         await state.shard_commands[shard_index].put({"op": "unsubscribe", "asset_ids": asset_ids})
 
     stats.markets_total = len(state.market_catalog)
-    stats.assets_total = len(state.asset_to_market)
+    stats.assets_total = len(state.asset_to_shard)
     await archive_resolved_market(state=state, market_meta=market_meta, event_payload=event_payload, stats=stats)
 
 
@@ -589,12 +618,13 @@ async def writer_task(
                 continue
 
             asset_by_id = {asset.asset_id: asset for asset in market_meta.assets}
-            mdir = market_dir(state.data_root, market_id)
-            mdir.mkdir(parents=True, exist_ok=True)
-
             if market_id not in known_markets:
                 known_markets.add(market_id)
+                mdir = market_dir(state.data_root, market_id)
+                mdir.mkdir(parents=True, exist_ok=True)
                 stats.markets_written += 1
+            else:
+                mdir = market_dir(state.data_root, market_id)
 
             book_lines: list[str] = []
             price_change_lines: list[str] = []
@@ -686,6 +716,7 @@ async def listen_shard(
     recv_timeout: float,
     idle_reconnect_seconds: float,
     proxy_url: str,
+    ws_max_queue: int,
 ) -> None:
     current_assets = set(initial_assets)
     failure_streak = 0
@@ -699,6 +730,7 @@ async def listen_shard(
                 ping_interval=20,
                 ping_timeout=20,
                 max_size=None,
+                max_queue=ws_max_queue,
             ) as ws:
                 failure_streak = 0
                 if current_assets:
@@ -757,6 +789,7 @@ async def listen_event_connection(
     recv_timeout: float,
     idle_reconnect_seconds: float,
     proxy_url: str,
+    ws_max_queue: int,
 ) -> None:
     failure_streak = 0
     subscribe_message = json.dumps(
@@ -776,6 +809,7 @@ async def listen_event_connection(
                 ping_interval=20,
                 ping_timeout=20,
                 max_size=None,
+                max_queue=ws_max_queue,
             ) as ws:
                 failure_streak = 0
                 await ws.send(subscribe_message)
@@ -900,14 +934,14 @@ async def main_async(args: argparse.Namespace) -> None:
     meta_path = data_root / "all_market_meta.json"
     await asyncio.to_thread(write_all_market_meta, meta_path, market_catalog)
 
-    shard_assets = [set(chunk) for chunk in chunks]
+    asset_to_shard, shard_loads = build_asset_to_shard(chunks)
     shard_commands = [asyncio.Queue() for _ in chunks]
     state = CollectorState(
         data_root=data_root,
         meta_path=meta_path,
         market_catalog=market_catalog,
-        asset_to_market=build_asset_to_market(market_catalog),
-        shard_assets=shard_assets,
+        asset_to_shard=asset_to_shard,
+        shard_loads=shard_loads,
         shard_commands=shard_commands,
         resolved_markets=set(),
         meta_lock=asyncio.Lock(),
@@ -939,6 +973,7 @@ async def main_async(args: argparse.Namespace) -> None:
                 recv_timeout=args.recv_timeout,
                 idle_reconnect_seconds=args.idle_reconnect_seconds,
                 proxy_url=args.proxy_url,
+                ws_max_queue=args.ws_max_queue,
             )
         )
         for idx, chunk in enumerate(chunks)
@@ -955,6 +990,7 @@ async def main_async(args: argparse.Namespace) -> None:
             recv_timeout=args.recv_timeout,
             idle_reconnect_seconds=args.idle_reconnect_seconds,
             proxy_url=args.proxy_url,
+            ws_max_queue=args.ws_max_queue,
         )
     )
 

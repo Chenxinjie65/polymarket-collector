@@ -8,7 +8,9 @@ version = "0.1.0"
 description = "Minimal Polymarket public data collector MVP"
 requires-python = ">=3.12"
 dependencies = [
+  "psutil>=5.9,<8",
   "requests>=2.31,<3",
+  "websockets>=13,<16",
   "websocket-client>=1.8,<2",
 ]
 

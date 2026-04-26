@@ -6,7 +6,8 @@ webscoket推送price_change和book两种事件，现在这个脚本只记录了b
 This version optimizes for low CPU usage.
 
 The collector no longer aligns rows across assets and no longer writes custom binary book files.
-Instead, it writes each received `book` record directly into per-market `books.jsonl`.
+Instead, it writes each received `book` record directly into per-market `books.jsonl`,
+and each received `price_change` entry into per-market `price_changes.jsonl`.
 
 ## Scripts
 
@@ -19,7 +20,7 @@ Instead, it writes each received `book` record directly into per-market `books.j
   - Main collector.
   - Fetches active markets at startup.
   - Maintains websocket connections.
-  - Writes append-only JSONL book history.
+  - Writes append-only JSONL history for `book` and `price_change`.
   - Handles `new_market` and `market_resolved`.
 - `monitor_books_runtime.py`
   - Records CPU, memory, process I/O, and data directory growth.
@@ -36,7 +37,7 @@ The current design intentionally trades storage efficiency for lower CPU cost:
 - no per-record Decimal scaling
 - no binary packing
 
-Each received `book` is appended almost as-is.
+Each received `book` and each individual `price_change` entry are appended almost as-is.
 
 ## Startup Flow
 
@@ -56,8 +57,8 @@ Each received `book` is appended almost as-is.
 
 - `custom_feature_enabled: false`
 - Subscribe by `asset_id`
-- Responsible for normal book flow
-- Persist only `book`
+- Responsible for normal market data flow
+- Persist `book` and `price_change`
 
 ### Dedicated event connection
 
@@ -108,6 +109,7 @@ Archive content:
   all_market_meta.json
   <market_id>/
     books.jsonl
+    price_changes.jsonl
   resolved_market/
     <market_id>.tar.xz
 ```
@@ -139,6 +141,22 @@ Fields such as:
 
 are not repeated in every line anymore. They are derived from the file path and `all_market_meta.json`.
 
+## `price_changes.jsonl` Format
+
+Each line is one compact received `price_change` entry, written in append-only form.
+
+Current compact fields:
+
+- `i`
+  - `asset_index`
+- `t`
+  - top-level websocket timestamp
+- remaining keys
+  - copied from each `price_changes[]` item, such as `price`, `size`, `side`, `hash`, `best_bid`, `best_ask`
+
+The websocket payload arrives as one `price_change` message containing a `price_changes[]` array.
+The collector expands that array and writes one JSONL line per entry.
+
 ## Why This Uses Less CPU
 
 Compared with the previous aligned binary format, this version avoids:
@@ -151,8 +169,9 @@ Compared with the previous aligned binary format, this version avoids:
 
 The main write path now does:
 
-1. group incoming books by market
-2. append JSON lines to `<market>/books.jsonl`
+1. group incoming market events by market
+2. append `book` rows to `<market>/books.jsonl`
+3. append expanded `price_change` rows to `<market>/price_changes.jsonl`
 
 This increases storage usage, but lowers CPU significantly.
 
