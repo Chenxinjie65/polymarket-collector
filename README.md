@@ -138,7 +138,7 @@ If the local machine should only download sealed compressed files:
   --compressed-only
 ```
 
-By default, pulling `finalized/*.jsonl.gz` writes remote ack files under
+By default, pulling files under `finalized/**` writes remote ack files under
 `state/transfers/acks/finalized/*.ack.json` and then deletes the corresponding
 remote compressed files. Use `--no-ack-delete-finalized` to disable that behavior.
 

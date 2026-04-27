@@ -253,7 +253,8 @@ done
 
 has_finalized_include=0
 for item in "${includes[@]}"; do
-  if [[ "${item#/}" == "finalized" ]]; then
+  normalized_item="${item#/}"
+  if [[ "$normalized_item" == "finalized" || "$normalized_item" == finalized/* ]]; then
     has_finalized_include=1
     break
   fi

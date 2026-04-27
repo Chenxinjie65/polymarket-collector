@@ -213,6 +213,23 @@ cd "$LOCAL_REPO_DIR"
   --dry-run
 ```
 
+建议先做一个小时包的快速连通性验证（体积小、返回快）：
+
+```bash
+TEST_BUNDLE_REL="$(ssh "$CLOUD_SSH" "find '$CLOUD_REMOTE_DATA_ROOT/finalized/hourly' -type f -name bundle.tar.gz | sed 's#^$CLOUD_REMOTE_DATA_ROOT/##' | tail -n 1")"
+cd "$LOCAL_REPO_DIR"
+./scripts/pull_cloud_data.sh \
+  --remote "${CLOUD_SSH}:${CLOUD_REMOTE_DATA_ROOT}" \
+  --local-root "$LOCAL_DATA_ROOT" \
+  --include "$TEST_BUNDLE_REL"
+```
+
+拉取完成后会在云端写 ack 并删除该压缩包，可用这条命令检查：
+
+```bash
+ssh "$CLOUD_SSH" "find '$CLOUD_REMOTE_DATA_ROOT/state/transfers/acks/finalized' -type f | tail"
+```
+
 正式拉取：
 
 ```bash
@@ -225,7 +242,9 @@ cd "$LOCAL_REPO_DIR"
   --include finalized
 ```
 
-默认会对 `finalized/*.jsonl.gz` 执行“拉取确认即删”：
+说明：`finalized/` 下的小时包可能较大，首次全量拉取耗时会明显更久；建议按小时频率拉取，避免单文件过大。
+
+默认会对 `finalized/**` 下已拉取文件执行“拉取确认即删”：
 
 - 本地拉到文件后，会在云端写入 ack 标记（`state/transfers/acks/finalized/*.ack.json`）
 - 写入 ack 成功后，删除对应云端压缩包
