@@ -125,7 +125,8 @@ Finalize completed hourly shard files into compressed outputs on the cloud node:
 
 ```bash
 python3 scripts/finalize_hourly_shards.py \
-  --data-root /var/lib/polymarket-books
+  --data-root /var/lib/polymarket-books \
+  --delete-source
 ```
 
 If the local machine should only download sealed compressed files:
@@ -136,6 +137,10 @@ If the local machine should only download sealed compressed files:
   --local-root /data/polymarket-books \
   --compressed-only
 ```
+
+By default, pulling `finalized/*.jsonl.gz` writes remote ack files under
+`state/transfers/acks/finalized/*.ack.json` and then deletes the corresponding
+remote compressed files. Use `--no-ack-delete-finalized` to disable that behavior.
 
 Write one heartbeat (primary node example):
 

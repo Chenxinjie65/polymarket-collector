@@ -12,6 +12,7 @@ dry_run=0
 compress=1
 verbose=0
 compressed_only=0
+ack_delete_finalized=1
 includes=()
 
 default_includes=(
@@ -48,6 +49,7 @@ Options:
   --identity-file PATH        SSH private key
   --bwlimit KBPS              Limit rsync bandwidth in KB/s
   --compressed-only           Only pull sealed compressed outputs and metadata
+  --no-ack-delete-finalized   Keep remote finalized/*.jsonl.gz after pull (default deletes with ack)
   --dry-run                   Show planned transfers only
   --no-compress               Disable rsync transport compression
   --verbose                   Print each rsync command
@@ -97,6 +99,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --compressed-only)
       compressed_only=1
+      shift
+      ;;
+    --no-ack-delete-finalized)
+      ack_delete_finalized=0
       shift
       ;;
     --dry-run)
@@ -193,6 +199,11 @@ done
 
 pulled_items=()
 missing_items=()
+ack_marked_count=0
+remote_deleted_count=0
+remote_missing_count=0
+remote_size_mismatch_count=0
+ts_now="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
 for item in "${includes[@]}"; do
   normalized_item="${item#/}"
@@ -240,7 +251,75 @@ for item in "${includes[@]}"; do
   missing_items+=("$normalized_item")
 done
 
-ts_now="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+has_finalized_include=0
+for item in "${includes[@]}"; do
+  if [[ "${item#/}" == "finalized" ]]; then
+    has_finalized_include=1
+    break
+  fi
+done
+
+if [[ $dry_run -eq 0 && $ack_delete_finalized -eq 1 && $has_finalized_include -eq 1 ]]; then
+  finalized_root="$local_root/finalized"
+  if [[ -d "$finalized_root" ]]; then
+    manifest_path="$(mktemp)"
+    find "$finalized_root" -type f -name "*.jsonl.gz" -printf '%P\t%s\n' >"$manifest_path"
+    if [[ -s "$manifest_path" ]]; then
+      local_ack_host="$(hostname -f 2>/dev/null || hostname)"
+      remote_cleanup_script='
+set -euo pipefail
+remote_root="$1"
+ack_ts="$2"
+ack_host="$3"
+ack_marked=0
+remote_deleted=0
+remote_missing=0
+remote_size_mismatch=0
+while IFS=$'\''\t'\'' read -r rel expected_size; do
+  [[ -n "$rel" ]] || continue
+  remote_file="$remote_root/finalized/$rel"
+  if [[ ! -f "$remote_file" ]]; then
+    remote_missing=$((remote_missing + 1))
+    continue
+  fi
+  actual_size="$(stat -c %s "$remote_file" 2>/dev/null || echo -1)"
+  if [[ "$actual_size" != "$expected_size" ]]; then
+    remote_size_mismatch=$((remote_size_mismatch + 1))
+    continue
+  fi
+  ack_file="$remote_root/state/transfers/acks/finalized/${rel}.ack.json"
+  mkdir -p "$(dirname "$ack_file")"
+  printf "{\\"acked_at_utc\\":\\"%s\\",\\"ack_host\\":\\"%s\\",\\"remote_file\\":\\"%s\\",\\"size_bytes\\":%s}\\n" \
+    "$ack_ts" "$ack_host" "$remote_file" "$actual_size" >"$ack_file"
+  rm -f "$remote_file"
+  ack_marked=$((ack_marked + 1))
+  remote_deleted=$((remote_deleted + 1))
+done
+printf "ack_marked=%d remote_deleted=%d remote_missing=%d remote_size_mismatch=%d\\n" \
+  "$ack_marked" "$remote_deleted" "$remote_missing" "$remote_size_mismatch"
+'
+      remote_cleanup_result="$(
+        "${ssh_cmd[@]}" "$remote_host" \
+          "bash -c $(printf '%q' "$remote_cleanup_script") -- \
+            $(printf '%q' "$remote_root") \
+            $(printf '%q' "$ts_now") \
+            $(printf '%q' "$local_ack_host")" <"$manifest_path"
+      )"
+      rm -f "$manifest_path"
+      for token in $remote_cleanup_result; do
+        case "$token" in
+          ack_marked=*) ack_marked_count="${token#ack_marked=}" ;;
+          remote_deleted=*) remote_deleted_count="${token#remote_deleted=}" ;;
+          remote_missing=*) remote_missing_count="${token#remote_missing=}" ;;
+          remote_size_mismatch=*) remote_size_mismatch_count="${token#remote_size_mismatch=}" ;;
+        esac
+      done
+    else
+      rm -f "$manifest_path"
+    fi
+  fi
+fi
+
 summary_path="$transfer_state_dir/pull_cloud_data_latest.json"
 
 pulled_json="[]"
@@ -276,8 +355,13 @@ cat >"$summary_path" <<EOF
   "compressed_only": $compressed_only,
   "dry_run": $dry_run,
   "compress": $compress,
+  "ack_delete_finalized": $ack_delete_finalized,
   "pulled_items": $pulled_json,
-  "missing_items": $missing_json
+  "missing_items": $missing_json,
+  "ack_marked": $ack_marked_count,
+  "remote_deleted": $remote_deleted_count,
+  "remote_missing": $remote_missing_count,
+  "remote_size_mismatch": $remote_size_mismatch_count
 }
 EOF
 

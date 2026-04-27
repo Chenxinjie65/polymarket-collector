@@ -136,12 +136,12 @@ sudo ./scripts/uninstall_books_systemd.sh --service-name "$CLOUD_SERVICE_NAME"
 crontab -e
 ```
 
-加入这一行。作用是每小时 `05` 分压缩已经结束的小时分区：
+加入这一行。作用是每小时 `05` 分压缩已经结束的小时分区，压缩成功后自动删除原始分片：
 
 如果你修改了仓库目录或数据目录，这里要同步替换成你的真实绝对路径。
 
 ```cron
-5 * * * * cd /srv/Poly-Collector && /srv/Poly-Collector/.venv/bin/python scripts/finalize_hourly_shards.py --data-root /var/lib/polymarket-books >> /var/lib/polymarket-books/state/finalize_hourly.log 2>&1
+5 * * * * cd /srv/Poly-Collector && /srv/Poly-Collector/.venv/bin/python scripts/finalize_hourly_shards.py --data-root /var/lib/polymarket-books --delete-source >> /var/lib/polymarket-books/state/finalize_hourly.log 2>&1
 ```
 
 手工验证一次压缩脚本：
@@ -150,6 +150,7 @@ crontab -e
 cd "$CLOUD_REPO_DIR"
 "$CLOUD_REPO_DIR/.venv/bin/python" scripts/finalize_hourly_shards.py \
   --data-root "$CLOUD_DATA_ROOT" \
+  --delete-source \
   --dry-run
 ```
 
@@ -223,6 +224,11 @@ cd "$LOCAL_REPO_DIR"
   --include resolved_market \
   --include finalized
 ```
+
+默认会对 `finalized/*.jsonl.gz` 执行“拉取确认即删”：
+
+- 本地拉到文件后，会在云端写入 ack 标记（`state/transfers/acks/finalized/*.ack.json`）
+- 写入 ack 成功后，删除对应云端压缩包
 
 如果要限速，例如限制到 `20 MB/s` 左右：
 
