@@ -263,7 +263,7 @@ if [[ $dry_run -eq 0 && $ack_delete_finalized -eq 1 && $has_finalized_include -e
   finalized_root="$local_root/finalized"
   if [[ -d "$finalized_root" ]]; then
     manifest_path="$(mktemp)"
-    find "$finalized_root" -type f -name "*.jsonl.gz" -printf '%P\t%s\n' >"$manifest_path"
+    find "$finalized_root" -type f -printf '%P\t%s\n' >"$manifest_path"
     if [[ -s "$manifest_path" ]]; then
       local_ack_host="$(hostname -f 2>/dev/null || hostname)"
       remote_cleanup_script='

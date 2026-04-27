@@ -121,7 +121,7 @@ Pull cloud-collected data back to a local machine over SSH:
   --local-root /data/polymarket-books
 ```
 
-Finalize completed hourly shard files into compressed outputs on the cloud node:
+Finalize completed hourly shard files into one compressed package per hour (`finalized/hourly/.../bundle.tar.gz`) on the cloud node:
 
 ```bash
 python3 scripts/finalize_hourly_shards.py \

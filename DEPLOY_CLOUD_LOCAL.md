@@ -136,7 +136,7 @@ sudo ./scripts/uninstall_books_systemd.sh --service-name "$CLOUD_SERVICE_NAME"
 crontab -e
 ```
 
-加入这一行。作用是每小时 `05` 分压缩已经结束的小时分区，压缩成功后自动删除原始分片：
+加入这一行。作用是每小时 `05` 分把已结束小时分区打成一个 `bundle.tar.gz` 大包，打包成功后自动删除原始分片：
 
 如果你修改了仓库目录或数据目录，这里要同步替换成你的真实绝对路径。
 
