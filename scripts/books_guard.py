@@ -58,6 +58,12 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="Forwarded to the runtime monitor",
     )
+    parser.add_argument(
+        "--collector-arg",
+        action="append",
+        default=[],
+        help="Extra argument forwarded to the collector process through the supervisor. Repeat for multiple arguments.",
+    )
     return parser.parse_args()
 
 
@@ -89,21 +95,15 @@ def pid_running(pid: int | None) -> bool:
         return False
 
 
-def launch_hidden_powershell(repo_root: Path, script_name: str, arguments: list[str], *, stdout: Path, stderr: Path) -> int:
+def launch_python_process(repo_root: Path, script_path: Path, arguments: list[str], *, stdout: Path, stderr: Path) -> int:
     stdout.parent.mkdir(parents=True, exist_ok=True)
     stderr.parent.mkdir(parents=True, exist_ok=True)
     create_no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     with stdout.open("ab") as stdout_f, stderr.open("ab") as stderr_f:
         proc = subprocess.Popen(
             [
-                "powershell.exe",
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-WindowStyle",
-                "Hidden",
-                "-File",
-                str(repo_root / "scripts" / script_name),
+                sys.executable,
+                str(script_path),
                 *arguments,
             ],
             cwd=repo_root,
@@ -121,14 +121,14 @@ def ensure_started(
     repo_root: Path,
     state_dir: Path,
     log_path: Path,
-    script_name: str,
+    script_path: Path,
     script_args: list[str],
 ) -> None:
     if running:
         return
-    launcher_pid = launch_hidden_powershell(
+    launcher_pid = launch_python_process(
         repo_root,
-        script_name,
+        script_path,
         script_args,
         stdout=state_dir / f"{component}_launcher_stdout.log",
         stderr=state_dir / f"{component}_launcher_stderr.log",
@@ -139,7 +139,7 @@ def ensure_started(
             "ts": datetime.now(UTC).isoformat(),
             "event": f"start_{component}",
             "launcher_pid": launcher_pid,
-            "script": script_name,
+            "script": str(script_path),
         },
     )
 
@@ -182,32 +182,32 @@ def main() -> int:
     )
 
     collector_args = [
-        "-DataRoot",
+        "--data-root",
         str(data_root),
-        "-CollectorScript",
+        "--collector-script",
         str(args.collector_script),
-        "-DurationSeconds",
+        "--duration-seconds",
         str(args.duration_seconds),
-        "-RestartDelaySeconds",
+        "--restart-delay-seconds",
         str(args.restart_delay_seconds),
-        "-MaxRestartDelaySeconds",
+        "--max-restart-delay-seconds",
         str(args.max_restart_delay_seconds),
-        "-StableResetSeconds",
+        "--stable-reset-seconds",
         str(args.stable_reset_seconds),
-        "-IdleReconnectSeconds",
+        "--idle-reconnect-seconds",
         str(args.idle_reconnect_seconds),
-        "-PythonExe",
-        sys.executable,
     ]
+    for extra_arg in args.collector_arg:
+        collector_args.extend(["--collector-arg", extra_arg])
     monitor_args = [
-        "-DataRoot",
+        "--data-root",
         str(data_root),
-        "-IntervalSeconds",
+        "--self-pid-file",
+        str(monitor_pid_path),
+        "--interval-seconds",
         str(args.monitor_interval_seconds),
-        "-DurationSeconds",
+        "--duration-seconds",
         str(args.monitor_duration_seconds),
-        "-PythonExe",
-        sys.executable,
     ]
 
     while True:
@@ -218,7 +218,7 @@ def main() -> int:
                 repo_root=repo_root,
                 state_dir=state_dir,
                 log_path=guard_log_path,
-                script_name="start_books_collector_hidden.ps1",
+                script_path=repo_root / "scripts" / "supervise_books_collector.py",
                 script_args=collector_args,
             )
             ensure_started(
@@ -227,7 +227,7 @@ def main() -> int:
                 repo_root=repo_root,
                 state_dir=state_dir,
                 log_path=guard_log_path,
-                script_name="start_books_monitor_hidden.ps1",
+                script_path=repo_root / "scripts" / "monitor_books_runtime.py",
                 script_args=monitor_args,
             )
         except Exception as exc:

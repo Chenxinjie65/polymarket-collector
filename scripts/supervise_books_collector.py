@@ -33,6 +33,12 @@ def parse_args() -> argparse.Namespace:
         default=90.0,
         help="Forwarded to the collector to force reconnect after idle time",
     )
+    parser.add_argument(
+        "--collector-arg",
+        action="append",
+        default=[],
+        help="Extra argument forwarded to the collector process. Repeat for multiple arguments.",
+    )
     return parser.parse_args()
 
 
@@ -87,6 +93,7 @@ def main() -> int:
                     str(args.duration_seconds),
                     "--idle-reconnect-seconds",
                     str(args.idle_reconnect_seconds),
+                    *args.collector_arg,
                 ],
                 cwd=repo_root,
                 stdout=stdout_f,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import lzma
 import random
@@ -11,6 +12,7 @@ import tarfile
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +23,8 @@ from websockets.exceptions import ConnectionClosed
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 MARKET_WSS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+PRICE_SCALE = 1_000_000
+SIZE_SCALE = 100
 HIGH_XZ_PRESET = 9 | lzma.PRESET_EXTREME
 
 
@@ -53,6 +57,10 @@ class AssetMeta:
 @dataclass(slots=True)
 class MarketMeta:
     market_id: str
+    market_index: int
+    write_shard: int
+    resolved: bool
+    resolved_at: str
     gamma_market_id: str
     question: str
     slug: str
@@ -66,11 +74,14 @@ class MarketMeta:
 class CollectorState:
     data_root: Path
     meta_path: Path
+    meta_journal_path: Path
     market_catalog: dict[str, MarketMeta]
     asset_to_shard: dict[str, int]
     shard_loads: list[int]
     shard_commands: list[asyncio.Queue]
     resolved_markets: set[str]
+    next_market_index: int
+    write_shards: int
     meta_lock: asyncio.Lock
 
 
@@ -78,7 +89,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Listen to all Polymarket books and store them in "
-            "all_market_meta.json + <market>/books.jsonl."
+            "all_market_meta.json + hourly shard jsonl files."
         )
     )
     parser.add_argument("--data-root", default="data_all_books_jsonl_live", help="Output root")
@@ -109,6 +120,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Max queued websocket messages per connection before applying backpressure.",
+    )
+    parser.add_argument(
+        "--write-shards",
+        type=int,
+        default=64,
+        help="Fixed shard count for hourly output files.",
     )
     parser.add_argument("--summary-file", default="run_summary.json", help="Summary path under state/")
     parser.add_argument(
@@ -144,6 +161,236 @@ def parse_outcomes(outcomes: Any) -> list[str]:
     return [str(item) for item in parsed]
 
 
+def scale_decimal(value: Any, scale: int) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        scaled = (Decimal(str(value)) * scale).to_integral_value()
+    except (InvalidOperation, ValueError):
+        return None
+    return int(scaled)
+
+
+def parse_timestamp_ms(value: Any) -> int:
+    if value in (None, ""):
+        return 0
+    try:
+        return max(0, int(str(value)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def stable_shard_index(key: str, shard_count: int) -> int:
+    normalized_count = max(1, shard_count)
+    digest = hashlib.blake2b(key.encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, "big") % normalized_count
+
+
+def timestamp_to_hour_bucket(timestamp_ms: int) -> tuple[str, str]:
+    if timestamp_ms > 0:
+        bucket_time = datetime.fromtimestamp(timestamp_ms / 1000, tz=UTC)
+    else:
+        bucket_time = datetime.now(UTC)
+    return bucket_time.strftime("%Y-%m-%d"), bucket_time.strftime("%H")
+
+
+def sharded_output_path(data_root: Path, dataset: str, timestamp_ms: int, shard_index: int) -> Path:
+    dt_value, hour_value = timestamp_to_hour_bucket(timestamp_ms)
+    return data_root / dataset / f"dt={dt_value}" / f"hour={hour_value}" / f"shard-{shard_index:04d}.jsonl"
+
+
+def initialize_market_storage(market_catalog: dict[str, MarketMeta], write_shards: int) -> int:
+    next_market_index = 1
+    for market_id in sorted(market_catalog):
+        market_meta = market_catalog[market_id]
+        market_meta.market_index = next_market_index
+        market_meta.write_shard = stable_shard_index(market_id, write_shards)
+        next_market_index += 1
+    return next_market_index
+
+
+def market_meta_to_dict(market_meta: MarketMeta) -> dict[str, Any]:
+    return {
+        "market": market_meta.market_id,
+        "market_index": market_meta.market_index,
+        "write_shard": market_meta.write_shard,
+        "resolved": market_meta.resolved,
+        "resolved_at": market_meta.resolved_at,
+        "gamma_market_id": market_meta.gamma_market_id,
+        "question": market_meta.question,
+        "slug": market_meta.slug,
+        "event_slug": market_meta.event_slug,
+        "condition_id": market_meta.condition_id,
+        "assets": [
+            {
+                "asset_index": asset.asset_index,
+                "asset_id": asset.asset_id,
+                "outcome": asset.outcome,
+                "tick_size": asset.tick_size,
+            }
+            for asset in market_meta.assets
+        ],
+    }
+
+
+def market_meta_from_dict(item: dict[str, Any], write_shards: int) -> MarketMeta | None:
+    market_id = str(item.get("market") or "")
+    if not market_id:
+        return None
+
+    assets: list[AssetMeta] = []
+    for asset in item.get("assets") or []:
+        asset_id = str(asset.get("asset_id") or "")
+        if not asset_id:
+            continue
+        try:
+            asset_index = int(asset.get("asset_index") or 0)
+        except (TypeError, ValueError):
+            asset_index = 0
+        if asset_index <= 0:
+            continue
+        assets.append(
+            AssetMeta(
+                asset_id=asset_id,
+                asset_index=asset_index,
+                outcome=str(asset.get("outcome") or ""),
+                tick_size=str(asset.get("tick_size") or "0.01"),
+            )
+        )
+
+    try:
+        market_index = int(item.get("market_index") or 0)
+    except (TypeError, ValueError):
+        market_index = 0
+    try:
+        write_shard = int(item.get("write_shard") or stable_shard_index(market_id, write_shards))
+    except (TypeError, ValueError):
+        write_shard = stable_shard_index(market_id, write_shards)
+
+    return MarketMeta(
+        market_id=market_id,
+        market_index=max(0, market_index),
+        write_shard=write_shard,
+        resolved=bool(item.get("resolved", False)),
+        resolved_at=str(item.get("resolved_at") or ""),
+        gamma_market_id=str(item.get("gamma_market_id") or ""),
+        question=str(item.get("question") or ""),
+        slug=str(item.get("slug") or ""),
+        event_slug=str(item.get("event_slug") or ""),
+        condition_id=str(item.get("condition_id") or market_id),
+        outcomes=[],
+        assets=assets,
+    )
+
+
+def _finalize_loaded_market_catalog(markets: list[dict[str, Any]], write_shards: int) -> tuple[dict[str, MarketMeta], int]:
+    market_catalog: dict[str, MarketMeta] = {}
+    max_market_index = 0
+    for item in markets:
+        if not isinstance(item, dict):
+            continue
+        market_meta = market_meta_from_dict(item, write_shards)
+        if market_meta is None:
+            continue
+        if market_meta.market_index <= 0:
+            max_market_index += 1
+            market_meta.market_index = max_market_index
+        else:
+            max_market_index = max(max_market_index, market_meta.market_index)
+        market_catalog[market_meta.market_id] = market_meta
+
+    return market_catalog, max_market_index + 1
+
+
+def load_existing_market_catalog(meta_path: Path, journal_path: Path, write_shards: int) -> tuple[dict[str, MarketMeta], int]:
+    if meta_path.exists():
+        payload = json.loads(meta_path.read_text(encoding="utf-8"))
+        markets = payload.get("markets")
+        if isinstance(markets, list):
+            return _finalize_loaded_market_catalog(markets, write_shards)
+
+    if journal_path.exists():
+        latest_by_market: dict[str, dict[str, Any]] = {}
+        with journal_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                market_payload = payload.get("market")
+                if not isinstance(market_payload, dict):
+                    continue
+                market_id = str(market_payload.get("market") or "")
+                if not market_id:
+                    continue
+                latest_by_market[market_id] = market_payload
+        if latest_by_market:
+            return _finalize_loaded_market_catalog(list(latest_by_market.values()), write_shards)
+
+    return {}, 1
+
+
+def merge_market_catalog(
+    *,
+    existing_catalog: dict[str, MarketMeta],
+    fetched_catalog: dict[str, MarketMeta],
+    write_shards: int,
+    next_market_index: int,
+) -> tuple[dict[str, MarketMeta], int]:
+    merged_catalog = dict(existing_catalog)
+
+    for market_id, fetched_meta in fetched_catalog.items():
+        existing = merged_catalog.get(market_id)
+        if existing is None:
+            fetched_meta.market_index = next_market_index
+            fetched_meta.write_shard = stable_shard_index(market_id, write_shards)
+            fetched_meta.resolved = False
+            fetched_meta.resolved_at = ""
+            merged_catalog[market_id] = fetched_meta
+            next_market_index += 1
+            continue
+
+        existing_assets = {asset.asset_id: asset for asset in existing.assets}
+        merged_assets = list(existing.assets)
+        next_asset_index = max((asset.asset_index for asset in merged_assets), default=0) + 1
+
+        for fetched_asset in fetched_meta.assets:
+            current_asset = existing_assets.get(fetched_asset.asset_id)
+            if current_asset is not None:
+                current_asset.outcome = fetched_asset.outcome or current_asset.outcome
+                current_asset.tick_size = fetched_asset.tick_size or current_asset.tick_size
+            else:
+                merged_assets.append(
+                    AssetMeta(
+                        asset_id=fetched_asset.asset_id,
+                        asset_index=next_asset_index,
+                        outcome=fetched_asset.outcome,
+                        tick_size=fetched_asset.tick_size,
+                    )
+                )
+                next_asset_index += 1
+
+        merged_catalog[market_id] = MarketMeta(
+            market_id=existing.market_id,
+            market_index=existing.market_index,
+            write_shard=existing.write_shard,
+            resolved=existing.resolved,
+            resolved_at=existing.resolved_at,
+            gamma_market_id=fetched_meta.gamma_market_id or existing.gamma_market_id,
+            question=fetched_meta.question or existing.question,
+            slug=fetched_meta.slug or existing.slug,
+            event_slug=fetched_meta.event_slug or existing.event_slug,
+            condition_id=fetched_meta.condition_id or existing.condition_id,
+            outcomes=fetched_meta.outcomes or existing.outcomes,
+            assets=merged_assets,
+        )
+
+    return merged_catalog, next_market_index
+
+
 def build_market_meta(item: dict[str, Any]) -> MarketMeta:
     asset_ids = parse_token_ids(item.get("clobTokenIds") or item.get("clob_token_ids") or item.get("assets_ids"))
     outcomes = parse_outcomes(item.get("outcomes"))
@@ -172,6 +419,10 @@ def build_market_meta(item: dict[str, Any]) -> MarketMeta:
 
     return MarketMeta(
         market_id=market_id,
+        market_index=0,
+        write_shard=0,
+        resolved=False,
+        resolved_at="",
         gamma_market_id=gamma_market_id,
         question=str(item.get("question") or ""),
         slug=str(item.get("slug") or ""),
@@ -294,49 +545,78 @@ def normalize_payload_items(payload: Any) -> list[dict[str, Any]]:
     return []
 
 
-def market_dir(root: Path, market_id: str) -> Path:
-    return root / market_id
-
-
-def compact_levels(levels: Any) -> list[list[str]]:
+def compact_levels(levels: Any) -> list[list[int]]:
     if not isinstance(levels, list):
         return []
-    compact: list[list[str]] = []
+    compact: list[list[int]] = []
     for level in levels:
         if not isinstance(level, dict):
             continue
-        price = level.get("price")
-        size = level.get("size")
-        if price in (None, "") or size in (None, ""):
+        scaled_price = scale_decimal(level.get("price"), PRICE_SCALE)
+        scaled_size = scale_decimal(level.get("size"), SIZE_SCALE)
+        if scaled_price is None or scaled_size is None:
             continue
-        compact.append([str(price), str(size)])
+        compact.append([scaled_price, scaled_size])
     return compact
 
 
-def compact_book_record(*, asset_index: int, book: dict[str, Any]) -> dict[str, Any]:
+def encode_side(value: Any) -> int | None:
+    side = str(value or "").upper()
+    if side == "BUY":
+        return 1
+    if side == "SELL":
+        return 2
+    return None
+
+
+def compact_book_record(*, market_index: int, asset_index: int, book: dict[str, Any]) -> dict[str, Any]:
     record: dict[str, Any] = {
+        "m": market_index,
         "i": asset_index,
-        "t": str(book.get("timestamp") or ""),
+        "t": parse_timestamp_ms(book.get("timestamp")),
         "b": compact_levels(book.get("bids")),
         "a": compact_levels(book.get("asks")),
     }
-    book_hash = book.get("hash")
-    if book_hash not in (None, ""):
-        record["h"] = str(book_hash)
     return record
 
 
-def compact_price_change_record(*, asset_index: int, price_change: dict[str, Any]) -> dict[str, Any]:
+def compact_price_change_record(*, market_index: int, asset_index: int, price_change: dict[str, Any]) -> dict[str, Any]:
     record: dict[str, Any] = {
+        "m": market_index,
         "i": asset_index,
-        "t": str(price_change.get("timestamp") or ""),
+        "t": parse_timestamp_ms(price_change.get("timestamp")),
+    }
+    short_key_map = {
+        "price": "p",
+        "size": "s",
+        "side": "y",
+        "best_bid": "bb",
+        "best_ask": "ba",
+    }
+    scale_map = {
+        "price": PRICE_SCALE,
+        "size": SIZE_SCALE,
+        "best_bid": PRICE_SCALE,
+        "best_ask": PRICE_SCALE,
     }
     for key, value in price_change.items():
         if key in {"asset_id", "market", "event_type", "timestamp"}:
             continue
         if value in (None, ""):
             continue
-        record[key] = value
+        if key == "side":
+            encoded_side = encode_side(value)
+            if encoded_side is not None:
+                record["y"] = encoded_side
+            continue
+        short_key = short_key_map.get(key, key)
+        scale = scale_map.get(key)
+        if scale is not None:
+            scaled = scale_decimal(value, scale)
+            if scaled is not None:
+                record[short_key] = scaled
+            continue
+        record[short_key] = value
     return record
 
 
@@ -350,30 +630,36 @@ def build_asset_to_shard(chunks: list[list[str]]) -> tuple[dict[str, int], list[
     return asset_to_shard, shard_loads
 
 
-def write_all_market_meta(meta_path: Path, market_catalog: dict[str, MarketMeta]) -> None:
+def append_market_catalog_event(journal_path: Path, op: str, market_meta: MarketMeta) -> None:
+    journal_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "ts_utc": datetime.now(UTC).isoformat(),
+        "op": op,
+        "market": market_meta_to_dict(market_meta),
+    }
+    with journal_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=True, separators=(",", ":")))
+        handle.write("\n")
+
+
+def bootstrap_market_catalog_journal(journal_path: Path, market_catalog: dict[str, MarketMeta]) -> None:
+    if journal_path.exists() and journal_path.stat().st_size > 0:
+        return
+    for market_meta in sorted(market_catalog.values(), key=lambda item: item.market_index):
+        append_market_catalog_event(journal_path, "bootstrap_market", market_meta)
+
+
+def write_all_market_meta(meta_path: Path, market_catalog: dict[str, MarketMeta], write_shards: int) -> None:
     meta_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "layout_version": 5,
-        "storage_format": "per-market append-only books.jsonl + price_changes.jsonl",
+        "layout_version": 7,
+        "storage_format": "hourly shard jsonl with compact integer encoding",
+        "price_scale": PRICE_SCALE,
+        "size_scale": SIZE_SCALE,
+        "write_shards": max(1, write_shards),
         "markets": [
-            {
-                "market": market_meta.market_id,
-                "gamma_market_id": market_meta.gamma_market_id,
-                "question": market_meta.question,
-                "slug": market_meta.slug,
-                "event_slug": market_meta.event_slug,
-                "condition_id": market_meta.condition_id,
-                "assets": [
-                    {
-                        "asset_index": asset.asset_index,
-                        "asset_id": asset.asset_id,
-                        "outcome": asset.outcome,
-                        "tick_size": asset.tick_size,
-                    }
-                    for asset in market_meta.assets
-                ],
-            }
-            for market_meta in market_catalog.values()
+            market_meta_to_dict(market_meta)
+            for market_meta in sorted(market_catalog.values(), key=lambda item: item.market_index)
         ],
     }
     meta_path.write_text(json.dumps(payload, ensure_ascii=True, separators=(",", ":")), encoding="utf-8")
@@ -382,7 +668,8 @@ def write_all_market_meta(meta_path: Path, market_catalog: dict[str, MarketMeta]
 async def persist_market_catalog(state: CollectorState) -> None:
     async with state.meta_lock:
         snapshot = dict(state.market_catalog)
-        await asyncio.to_thread(write_all_market_meta, state.meta_path, snapshot)
+        await asyncio.to_thread(write_all_market_meta, state.meta_path, snapshot, state.write_shards)
+
 
 def choose_shard_index(shard_loads: list[int]) -> int:
     return min(range(len(shard_loads)), key=shard_loads.__getitem__)
@@ -397,9 +684,15 @@ async def add_new_markets(state: CollectorState, market_metas: list[MarketMeta],
             continue
         if not market_meta.assets:
             continue
+        market_meta.market_index = state.next_market_index
+        market_meta.write_shard = stable_shard_index(market_meta.market_id, state.write_shards)
+        market_meta.resolved = False
+        market_meta.resolved_at = ""
+        state.next_market_index += 1
 
         state.market_catalog[market_meta.market_id] = market_meta
         added_markets += 1
+        await asyncio.to_thread(append_market_catalog_event, state.meta_journal_path, "add_market", market_meta)
 
         for asset in market_meta.assets:
             if asset.asset_id in state.asset_to_shard:
@@ -438,6 +731,11 @@ async def upsert_market_meta(
     if existing is None:
         if not market_meta.assets:
             return False
+        market_meta.market_index = state.next_market_index
+        market_meta.write_shard = stable_shard_index(market_meta.market_id, state.write_shards)
+        market_meta.resolved = False
+        market_meta.resolved_at = ""
+        state.next_market_index += 1
         state.market_catalog[market_meta.market_id] = market_meta
         changed = True
         for asset in market_meta.assets:
@@ -476,6 +774,10 @@ async def upsert_market_meta(
 
         updated = MarketMeta(
             market_id=existing.market_id,
+            market_index=existing.market_index,
+            write_shard=existing.write_shard,
+            resolved=existing.resolved,
+            resolved_at=existing.resolved_at,
             gamma_market_id=market_meta.gamma_market_id or existing.gamma_market_id,
             question=market_meta.question or existing.question,
             slug=market_meta.slug or existing.slug,
@@ -499,6 +801,7 @@ async def upsert_market_meta(
     if not changed and not pending_by_shard:
         return False
 
+    await asyncio.to_thread(append_market_catalog_event, state.meta_journal_path, "upsert_market", state.market_catalog[market_meta.market_id])
     await persist_market_catalog(state)
     for shard_index, asset_ids in pending_by_shard.items():
         await state.shard_commands[shard_index].put({"op": "subscribe", "asset_ids": asset_ids})
@@ -526,17 +829,24 @@ def archive_resolved_market_sync(
     resolved_root = data_root / "resolved_market"
     resolved_root.mkdir(parents=True, exist_ok=True)
     archive_path = resolved_root / f"{market_id}.tar.xz"
-    if archive_path.exists():
-        if market_path.exists():
-            shutil.rmtree(market_path, ignore_errors=True)
-        return
-
-    with tarfile.open(archive_path, mode="w:xz", preset=HIGH_XZ_PRESET) as tar:
-        if market_path.exists():
-            tar.add(market_path, arcname=market_id, recursive=True)
+    marker_path = resolved_root / f"{market_id}.json"
 
     if market_path.exists():
+        if not archive_path.exists():
+            with tarfile.open(archive_path, mode="w:xz", preset=HIGH_XZ_PRESET) as tar:
+                tar.add(market_path, arcname=market_id, recursive=True)
         shutil.rmtree(market_path, ignore_errors=True)
+
+    marker_payload = {
+        "market": market_id,
+        "market_index": market_meta.market_index,
+        "write_shard": market_meta.write_shard,
+        "resolved_at": datetime.now(UTC).isoformat(),
+        "layout_version": 7,
+        "note": "shared hourly shard files stay in place; this marker only stops future collection",
+        "event": event_payload,
+    }
+    marker_path.write_text(json.dumps(marker_payload, ensure_ascii=True, indent=2), encoding="utf-8")
 
 
 async def archive_resolved_market(
@@ -565,10 +875,12 @@ async def handle_market_resolved(
     if not market_id or market_id in state.resolved_markets:
         return
 
-    market_meta = state.market_catalog.pop(market_id, None)
+    market_meta = state.market_catalog.get(market_id)
     if market_meta is None:
         return
 
+    market_meta.resolved = True
+    market_meta.resolved_at = datetime.now(UTC).isoformat()
     state.resolved_markets.add(market_id)
     pending_by_shard: dict[int, list[str]] = {}
 
@@ -579,6 +891,7 @@ async def handle_market_resolved(
         state.shard_loads[shard_index] = max(0, state.shard_loads[shard_index] - 1)
         pending_by_shard.setdefault(shard_index, []).append(asset.asset_id)
 
+    await asyncio.to_thread(append_market_catalog_event, state.meta_journal_path, "resolve_market", market_meta)
     await persist_market_catalog(state)
     for shard_index, asset_ids in pending_by_shard.items():
         await state.shard_commands[shard_index].put({"op": "unsubscribe", "asset_ids": asset_ids})
@@ -602,55 +915,62 @@ async def writer_task(
             break
 
         events: list[dict[str, Any]] = item
-        grouped: dict[str, list[dict[str, Any]]] = {}
+        lines_by_path: dict[Path, list[str]] = {}
+        asset_maps_by_market: dict[str, dict[str, AssetMeta]] = {}
+
         for event in events:
             market_id = str(event.get("market") or "")
             asset_id = str(event.get("asset_id") or "")
             if not market_id or not asset_id:
                 continue
-            if market_id in state.resolved_markets or market_id not in state.market_catalog:
-                continue
-            grouped.setdefault(market_id, []).append(event)
 
-        for market_id, market_events in grouped.items():
             market_meta = state.market_catalog.get(market_id)
-            if market_meta is None:
+            if market_meta is None or market_id in state.resolved_markets:
                 continue
 
-            asset_by_id = {asset.asset_id: asset for asset in market_meta.assets}
+            asset_by_id = asset_maps_by_market.get(market_id)
+            if asset_by_id is None:
+                asset_by_id = {asset.asset_id: asset for asset in market_meta.assets}
+                asset_maps_by_market[market_id] = asset_by_id
+            asset_meta = asset_by_id.get(asset_id)
+            if asset_meta is None:
+                continue
+
             if market_id not in known_markets:
                 known_markets.add(market_id)
-                mdir = market_dir(state.data_root, market_id)
-                mdir.mkdir(parents=True, exist_ok=True)
                 stats.markets_written += 1
-            else:
-                mdir = market_dir(state.data_root, market_id)
 
-            book_lines: list[str] = []
-            price_change_lines: list[str] = []
-            for event in market_events:
-                asset_id = str(event.get("asset_id") or "")
-                asset_meta = asset_by_id.get(asset_id)
-                if asset_meta is None:
-                    continue
-                event_type = str(event.get("event_type") or "")
-                if event_type == "book":
-                    compact = compact_book_record(asset_index=asset_meta.asset_index, book=event)
-                    book_lines.append(json.dumps(compact, ensure_ascii=False, separators=(",", ":")))
-                elif event_type == "price_change":
-                    compact = compact_price_change_record(asset_index=asset_meta.asset_index, price_change=event)
-                    price_change_lines.append(json.dumps(compact, ensure_ascii=False, separators=(",", ":")))
+            event_type = str(event.get("event_type") or "")
+            timestamp_ms = parse_timestamp_ms(event.get("timestamp"))
+            if event_type == "book":
+                compact = compact_book_record(
+                    market_index=market_meta.market_index,
+                    asset_index=asset_meta.asset_index,
+                    book=event,
+                )
+                path = sharded_output_path(state.data_root, "books", timestamp_ms, market_meta.write_shard)
+                lines_by_path.setdefault(path, []).append(
+                    json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
+                )
+            elif event_type == "price_change":
+                compact = compact_price_change_record(
+                    market_index=market_meta.market_index,
+                    asset_index=asset_meta.asset_index,
+                    price_change=event,
+                )
+                path = sharded_output_path(state.data_root, "price_changes", timestamp_ms, market_meta.write_shard)
+                lines_by_path.setdefault(path, []).append(
+                    json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
+                )
 
-            if book_lines:
-                blob = ("\n".join(book_lines) + "\n").encode("utf-8")
-                with (mdir / "books.jsonl").open("ab") as f:
-                    f.write(blob)
+        for path, lines in lines_by_path.items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            blob = ("\n".join(lines) + "\n").encode("utf-8")
+            with path.open("ab") as f:
+                f.write(blob)
+            if path.parts[-4] == "books":
                 stats.books_bytes += len(blob)
-
-            if price_change_lines:
-                blob = ("\n".join(price_change_lines) + "\n").encode("utf-8")
-                with (mdir / "price_changes.jsonl").open("ab") as f:
-                    f.write(blob)
+            else:
                 stats.price_change_bytes += len(blob)
 
         queue.task_done()
@@ -918,10 +1238,26 @@ async def main_async(args: argparse.Namespace) -> None:
     loop.set_exception_handler(quiet_websocket_bug)
 
     stop_at = None if args.duration_seconds <= 0 else asyncio.get_running_loop().time() + args.duration_seconds
-    market_catalog, asset_ids = await fetch_markets_and_assets_with_retry(
+    fetched_catalog, asset_ids = await fetch_markets_and_assets_with_retry(
         page_limit=args.page_limit,
         stop_at=stop_at,
         proxy_url=args.proxy_url,
+    )
+    data_root = Path(args.data_root)
+    meta_path = data_root / "all_market_meta.json"
+    meta_journal_path = data_root / "state" / "market_catalog.jsonl"
+
+    existing_catalog, next_market_index = await asyncio.to_thread(
+        load_existing_market_catalog,
+        meta_path,
+        meta_journal_path,
+        args.write_shards,
+    )
+    market_catalog, next_market_index = merge_market_catalog(
+        existing_catalog=existing_catalog,
+        fetched_catalog=fetched_catalog,
+        write_shards=args.write_shards,
+        next_market_index=next_market_index,
     )
     chunks = chunked(asset_ids, args.chunk_size)
     stats = RunStats(
@@ -929,21 +1265,22 @@ async def main_async(args: argparse.Namespace) -> None:
         assets_total=len(asset_ids),
         chunks_total=len(chunks),
     )
-
-    data_root = Path(args.data_root)
-    meta_path = data_root / "all_market_meta.json"
-    await asyncio.to_thread(write_all_market_meta, meta_path, market_catalog)
+    await asyncio.to_thread(write_all_market_meta, meta_path, market_catalog, args.write_shards)
+    await asyncio.to_thread(bootstrap_market_catalog_journal, meta_journal_path, market_catalog)
 
     asset_to_shard, shard_loads = build_asset_to_shard(chunks)
     shard_commands = [asyncio.Queue() for _ in chunks]
     state = CollectorState(
         data_root=data_root,
         meta_path=meta_path,
+        meta_journal_path=meta_journal_path,
         market_catalog=market_catalog,
         asset_to_shard=asset_to_shard,
         shard_loads=shard_loads,
         shard_commands=shard_commands,
-        resolved_markets=set(),
+        resolved_markets={market_id for market_id, market_meta in market_catalog.items() if market_meta.resolved},
+        next_market_index=next_market_index,
+        write_shards=max(1, args.write_shards),
         meta_lock=asyncio.Lock(),
     )
 

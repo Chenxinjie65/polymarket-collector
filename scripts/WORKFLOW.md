@@ -6,8 +6,8 @@ webscoket推送price_change和book两种事件，现在这个脚本只记录了b
 This version optimizes for low CPU usage.
 
 The collector no longer aligns rows across assets and no longer writes custom binary book files.
-Instead, it writes each received `book` record directly into per-market `books.jsonl`,
-and each received `price_change` entry into per-market `price_changes.jsonl`.
+Instead, it writes each received `book` record into an hourly shard file under `books/`,
+and each received `price_change` entry into an hourly shard file under `price_changes/`.
 
 ## Scripts
 
@@ -20,12 +20,12 @@ and each received `price_change` entry into per-market `price_changes.jsonl`.
   - Main collector.
   - Fetches active markets at startup.
   - Maintains websocket connections.
-  - Writes append-only JSONL history for `book` and `price_change`.
+  - Writes append-only hourly shard JSONL history for `book` and `price_change`.
   - Handles `new_market` and `market_resolved`.
 - `monitor_books_runtime.py`
   - Records CPU, memory, process I/O, and data directory growth.
 - `decode_books_samples.py`
-  - Reads `books.jsonl` and prints readable samples.
+  - Reads either legacy per-market `books.jsonl` or the new sharded layout and prints readable samples.
 
 ## Storage Model
 
@@ -33,11 +33,16 @@ The current design intentionally trades storage efficiency for lower CPU cost:
 
 - no timestamp alignment across assets
 - no zero-row backfilling
-- no custom numeric encoding
-- no per-record Decimal scaling
 - no binary packing
+- no per-market live file fanout
 
-Each received `book` and each individual `price_change` entry are appended almost as-is.
+It still applies two production-oriented reductions compared with the old per-market JSONL layout:
+
+- fixed hourly partitioning
+- fixed shard fanout per hour, for example `32` or `64`
+- compact field names plus integer scaling for price and size fields
+
+Each received `book` and each individual `price_change` entry are appended in compact JSONL form.
 
 ## Startup Flow
 
@@ -47,9 +52,10 @@ Each received `book` and each individual `price_change` entry are appended almos
    - `archived=false`
 2. Build in-memory `market_catalog`
 3. Persist metadata to `all_market_meta.json`
-4. Extract all `asset_id` values
-5. Split assets into websocket shards
-6. Start websocket listeners and the JSONL writer
+4. Append catalog bootstrap entries into `state/market_catalog.jsonl` when needed
+5. Extract all active `asset_id` values
+6. Split assets into websocket shards
+7. Start websocket listeners and the JSONL writer
 
 ## Websocket Layout
 
@@ -79,10 +85,12 @@ The collector fully trusts `new_market`.
 When a `new_market` event arrives:
 
 1. Build `MarketMeta` directly from the event payload
-2. Insert it into in-memory `market_catalog`
-3. Persist the updated catalog to `all_market_meta.json`
-4. Assign the new `asset_id` values to normal shard connections
-5. Send websocket `subscribe` immediately
+2. Assign a permanent `market_index` if the market has never been seen before
+3. Insert or update it in in-memory `market_catalog`
+4. Append the change into `state/market_catalog.jsonl`
+5. Persist the updated snapshot to `all_market_meta.json`
+6. Assign the new `asset_id` values to normal shard connections
+7. Send websocket `subscribe` immediately
 
 There is no delayed validation or hourly reconciliation.
 
@@ -90,46 +98,74 @@ There is no delayed validation or hourly reconciliation.
 
 When a `market_resolved` event arrives:
 
-1. Remove the market from `market_catalog`
+1. Mark the market as resolved inside `market_catalog`
 2. Remove its assets from shard subscriptions
-3. Persist the updated catalog
-4. Stop further collection for that market
-5. Archive that market directory into:
+3. Append the resolved state into `state/market_catalog.jsonl`
+4. Persist the updated snapshot
+5. Stop further collection for that market
+6. Write a resolved marker into:
+   - `resolved_market/<market_id>.json`
+7. If a legacy per-market directory still exists from an older layout, archive it into:
    - `resolved_market/<market_id>.tar.xz`
-6. Delete the original live market directory
+8. Shared hourly shard files remain in place
 
 Archive content:
 
-- only the raw files already stored for that market
+- in the new layout, only a resolved marker is written because market records are mixed into shared shard files
+- if a legacy live market directory exists, it is archived before deletion
 
 ## Storage Layout
 
 ```text
 <data-root>/
   all_market_meta.json
-  <market_id>/
-    books.jsonl
-    price_changes.jsonl
+  state/
+    market_catalog.jsonl
+  books/
+    dt=YYYY-MM-DD/
+      hour=HH/
+        shard-0000.jsonl
+        ...
+  price_changes/
+    dt=YYYY-MM-DD/
+      hour=HH/
+        shard-0000.jsonl
+        ...
   resolved_market/
-    <market_id>.tar.xz
+    <market_id>.json
+    <market_id>.tar.xz   # only when a legacy market directory exists
 ```
 
-## `books.jsonl` Format
+Each market is assigned:
+
+- a permanent `market_index`
+- a stable `write_shard`
+- a `resolved` flag that is kept after market close
+
+These are stored in `all_market_meta.json`. Changes are also appended to `state/market_catalog.jsonl`.
+The shard files contain many markets, but a given market always lands in the same shard number across hours.
+
+## `books/.../shard-XXXX.jsonl` Format
 
 Each line is one compact received `book` row, written in append-only form.
 
 Current compact fields:
 
+- `m`
+  - `market_index`
 - `i`
   - `asset_index`
 - `t`
-  - `timestamp`
-- `h`
-  - `hash` if present
+  - `timestamp_ms`
 - `b`
-  - bids as `[[price,size], ...]`
+  - bids as `[[price_int,size_int], ...]`
 - `a`
-  - asks as `[[price,size], ...]`
+  - asks as `[[price_int,size_int], ...]`
+
+Scaling:
+
+- price fields use `price_scale=1_000_000`
+- size fields use `size_scale=100`
 
 Fields such as:
 
@@ -137,22 +173,35 @@ Fields such as:
 - `asset_id`
 - `tick_size`
 - `event_type`
-- `last_trade_price`
+- hour partition
+- shard id
 
 are not repeated in every line anymore. They are derived from the file path and `all_market_meta.json`.
 
-## `price_changes.jsonl` Format
+## `price_changes/.../shard-XXXX.jsonl` Format
 
 Each line is one compact received `price_change` entry, written in append-only form.
 
 Current compact fields:
 
+- `m`
+  - `market_index`
 - `i`
   - `asset_index`
 - `t`
-  - top-level websocket timestamp
-- remaining keys
-  - copied from each `price_changes[]` item, such as `price`, `size`, `side`, `hash`, `best_bid`, `best_ask`
+  - top-level websocket timestamp in milliseconds
+- `p`
+  - `price` scaled by `1_000_000`
+- `s`
+  - `size` scaled by `100`
+- `y`
+  - side code: `1=BUY`, `2=SELL`
+- `bb`
+  - `best_bid` scaled by `1_000_000`
+- `ba`
+  - `best_ask` scaled by `1_000_000`
+- remaining unknown keys
+  - copied through if present
 
 The websocket payload arrives as one `price_change` message containing a `price_changes[]` array.
 The collector expands that array and writes one JSONL line per entry.
@@ -164,14 +213,14 @@ Compared with the previous aligned binary format, this version avoids:
 - sorting by timestamp within each market batch
 - expanding one timestamp into rows for every asset in the market
 - writing empty rows for non-updated assets
-- Decimal scaling and integer packing
 - repeated binary struct encoding
+- per-market live file fanout
 
 The main write path now does:
 
-1. group incoming market events by market
-2. append `book` rows to `<market>/books.jsonl`
-3. append expanded `price_change` rows to `<market>/price_changes.jsonl`
+1. group incoming market events by `hour + write_shard + dataset`
+2. append compact `book` rows to `books/dt=.../hour=.../shard-XXXX.jsonl`
+3. append expanded compact `price_change` rows to `price_changes/dt=.../hour=.../shard-XXXX.jsonl`
 
 This increases storage usage, but lowers CPU significantly.
 
@@ -201,11 +250,11 @@ flowchart TD
     F --> G[Start Normal Shard WS]
     F --> H[Start Event WS]
     G --> I[Receive book]
-    I --> J[Append to market/books.jsonl]
+    I --> J[Append to hourly shard file]
     H --> K{Event Type}
     K -->|new_market| L[Add to market_catalog immediately]
     L --> M[Persist all_market_meta.json]
     M --> N[Subscribe new assets immediately]
     K -->|market_resolved| O[Unsubscribe market assets]
-    O --> P[Archive market to resolved_market/*.tar.xz]
+    O --> P[Write resolved marker]
 ```

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import statistics
 import time
 from dataclasses import dataclass
@@ -70,6 +71,11 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         default="",
         help="Output directory for samples.csv and summary.json. Defaults to <data-root>/state/monitor.",
+    )
+    parser.add_argument(
+        "--self-pid-file",
+        default=str(DEFAULT_DATA_ROOT / "state" / "monitor.pid"),
+        help="PID file to write for this monitor process.",
     )
     return parser.parse_args()
 
@@ -249,8 +255,11 @@ def summarize(samples: list[Sample], *, pid: int, data_root: Path, interval_seco
 def main() -> int:
     args = parse_args()
     data_root = Path(args.data_root)
+    self_pid_file = Path(args.self_pid_file)
     output_dir = Path(args.output_dir) if args.output_dir else data_root / "state" / "monitor"
     output_dir.mkdir(parents=True, exist_ok=True)
+    self_pid_file.parent.mkdir(parents=True, exist_ok=True)
+    self_pid_file.write_text(str(os.getpid()), encoding="utf-8")
     samples_path = output_dir / "samples.csv"
     latest_path = output_dir / "latest.json"
     summary_path = output_dir / "summary.json"

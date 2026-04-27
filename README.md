@@ -89,6 +89,54 @@ Stream public market WebSocket events for the first 10 discovered assets:
 python -m polymarket_collector stream-market --markets-file latest --max-assets 10
 ```
 
+Run the books collector stack on Linux with the native shell wrappers:
+
+```bash
+./scripts/start_books_guard.sh \
+  --data-root /var/lib/polymarket-books \
+  --collector-arg=--write-shards \
+  --collector-arg=64
+```
+
+Stop the Linux books stack:
+
+```bash
+./scripts/stop_books_stack.sh --data-root /var/lib/polymarket-books
+```
+
+Install the books guard as a `systemd` service on Linux:
+
+```bash
+sudo ./scripts/install_books_systemd.sh \
+  --data-root /var/lib/polymarket-books \
+  --collector-arg=--write-shards \
+  --collector-arg=64
+```
+
+Pull cloud-collected data back to a local machine over SSH:
+
+```bash
+./scripts/pull_cloud_data.sh \
+  --remote collector@example.com:/var/lib/polymarket-books \
+  --local-root /data/polymarket-books
+```
+
+Finalize completed hourly shard files into compressed outputs on the cloud node:
+
+```bash
+python3 scripts/finalize_hourly_shards.py \
+  --data-root /var/lib/polymarket-books
+```
+
+If the local machine should only download sealed compressed files:
+
+```bash
+./scripts/pull_cloud_data.sh \
+  --remote collector@example.com:/var/lib/polymarket-books \
+  --local-root /data/polymarket-books \
+  --compressed-only
+```
+
 Write one heartbeat (primary node example):
 
 ```bash
