@@ -94,8 +94,8 @@ Run the books collector stack on Linux with the native shell wrappers:
 ```bash
 ./scripts/start_books_guard.sh \
   --data-root /var/lib/polymarket-books \
-  --collector-arg=--write-shards \
-  --collector-arg=64
+  --collector-arg "--write-shards" \
+  --collector-arg "64"
 ```
 
 Stop the Linux books stack:
@@ -109,8 +109,8 @@ Install the books guard as a `systemd` service on Linux:
 ```bash
 sudo ./scripts/install_books_systemd.sh \
   --data-root /var/lib/polymarket-books \
-  --collector-arg=--write-shards \
-  --collector-arg=64
+  --collector-arg "--write-shards" \
+  --collector-arg "64"
 ```
 
 Pull cloud-collected data back to a local machine over SSH:

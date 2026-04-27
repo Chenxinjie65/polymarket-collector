@@ -121,7 +121,7 @@ cmd=(
 )
 
 for extra_arg in "${collector_args[@]}"; do
-  cmd+=("--collector-arg" "$extra_arg")
+  cmd+=("--collector-arg=$extra_arg")
 done
 
 quoted_cmd="$(printf '%q ' "${cmd[@]}")"

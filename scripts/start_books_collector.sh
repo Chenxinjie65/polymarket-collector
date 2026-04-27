@@ -116,7 +116,7 @@ cmd=(
 )
 
 for extra_arg in "${collector_args[@]}"; do
-  cmd+=("--collector-arg" "$extra_arg")
+  cmd+=("--collector-arg=$extra_arg")
 done
 
 "${cmd[@]}" >>"$stdout" 2>>"$stderr" &

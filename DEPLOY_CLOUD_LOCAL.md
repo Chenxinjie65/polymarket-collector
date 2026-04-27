@@ -13,7 +13,8 @@
 云服务器上使用这些变量：
 
 ```bash
-export REPO_URL='<你的仓库地址>'
+export REPO_URL='https://github.com/Chenxinjie65/polymarket-collector.git'
+export DEPLOY_BRANCH='optimize-collector-runtime'
 export CLOUD_REPO_DIR='/srv/Poly-Collector'
 export CLOUD_DATA_ROOT='/var/lib/polymarket-books'
 export CLOUD_SERVICE_NAME='polymarket-books-guard'
@@ -22,12 +23,15 @@ export CLOUD_SERVICE_NAME='polymarket-books-guard'
 本地机器上使用这些变量：
 
 ```bash
-export LOCAL_REPO_URL='<你的仓库地址>'
+export LOCAL_REPO_URL='https://github.com/Chenxinjie65/polymarket-collector.git'
+export DEPLOY_BRANCH='optimize-collector-runtime'
 export LOCAL_REPO_DIR="$HOME/Poly-Collector"
 export LOCAL_DATA_ROOT='/data/polymarket-books'
 export CLOUD_SSH='youruser@your-server'
 export CLOUD_REMOTE_DATA_ROOT='/var/lib/polymarket-books'
 ```
+
+当前部署使用的代码在 `optimize-collector-runtime` 分支上。仓库默认分支不是它，所以拉代码时需要显式指定 `"$DEPLOY_BRANCH"`。
 
 ## 2. 云服务器初始化
 
@@ -41,7 +45,7 @@ sudo apt-get install -y python3 python3-venv rsync git
 拉代码并安装 Python 环境：
 
 ```bash
-git clone "$REPO_URL" "$CLOUD_REPO_DIR"
+git clone --branch "$DEPLOY_BRANCH" "$REPO_URL" "$CLOUD_REPO_DIR"
 cd "$CLOUD_REPO_DIR"
 python3 -m venv .venv
 . .venv/bin/activate
@@ -66,8 +70,8 @@ cd "$CLOUD_REPO_DIR"
 ./scripts/start_books_guard.sh \
   --data-root "$CLOUD_DATA_ROOT" \
   --python-exe "$CLOUD_REPO_DIR/.venv/bin/python" \
-  --collector-arg=--write-shards \
-  --collector-arg=64
+  --collector-arg "--write-shards" \
+  --collector-arg "64"
 ```
 
 检查进程和日志：
@@ -104,8 +108,8 @@ sudo ./scripts/install_books_systemd.sh \
   --service-name "$CLOUD_SERVICE_NAME" \
   --data-root "$CLOUD_DATA_ROOT" \
   --python-exe "$CLOUD_REPO_DIR/.venv/bin/python" \
-  --collector-arg=--write-shards \
-  --collector-arg=64
+  --collector-arg "--write-shards" \
+  --collector-arg "64"
 ```
 
 检查服务状态：
@@ -161,7 +165,7 @@ sudo apt-get install -y rsync openssh-client git
 拉代码：
 
 ```bash
-git clone "$LOCAL_REPO_URL" "$LOCAL_REPO_DIR"
+git clone --branch "$DEPLOY_BRANCH" "$LOCAL_REPO_URL" "$LOCAL_REPO_DIR"
 cd "$LOCAL_REPO_DIR"
 ```
 

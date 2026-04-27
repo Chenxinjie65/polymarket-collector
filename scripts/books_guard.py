@@ -156,6 +156,7 @@ def main() -> int:
     guard_pid_path = state_dir / "guard.pid"
     guard_log_path = state_dir / "guard.log"
     supervisor_pid_path = state_dir / "supervisor.pid"
+    stream_pid_path = state_dir / "stream.pid"
     monitor_pid_path = state_dir / "monitor.pid"
 
     existing_guard_pid = read_pid(guard_pid_path)
@@ -198,10 +199,12 @@ def main() -> int:
         str(args.idle_reconnect_seconds),
     ]
     for extra_arg in args.collector_arg:
-        collector_args.extend(["--collector-arg", extra_arg])
+        collector_args.append(f"--collector-arg={extra_arg}")
     monitor_args = [
         "--data-root",
         str(data_root),
+        "--pid-file",
+        str(stream_pid_path),
         "--self-pid-file",
         str(monitor_pid_path),
         "--interval-seconds",
